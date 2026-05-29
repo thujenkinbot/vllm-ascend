@@ -48,7 +48,7 @@ def init_ascend_model_parallel(
     backend = torch.distributed.get_backend(get_world_group().device_group)
     global_tp_size = 1 if parallel_config.enable_edge_cloud else parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
-    global_pp_size = parallel_config.pipeline_parallel_size
+    global_pp_size = 1 if parallel_config.enable_edge_cloud else parallel_config.pipeline_parallel_size
     global_pcp_size = parallel_config.prefill_context_parallel_size
 
     # The layout of all ranks: ExternalDP * EP
