@@ -11,6 +11,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     get_world_group,
     init_model_parallel_group,
+    is_edge_cloud_pp_mode,
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
