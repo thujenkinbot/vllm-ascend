@@ -13,6 +13,8 @@ from vllm.model_executor.models.kimi_k25 import (
 )
 from vllm.sequence import IntermediateTensors
 
+import vllm_ascend.patch.models.deepseek_v2_edge_cloud  # noqa: F401
+
 
 def _kimi_k25_forward_edge_cloud_segment(
     self: KimiK25ForConditionalGeneration,
