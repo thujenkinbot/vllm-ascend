@@ -249,8 +249,14 @@ def model_parallel_initialized():
 
 
 def get_mc2_group() -> GroupCoordinator:
-    assert _MC2 is not None, "mc2 group is not initialized"
-    return _MC2
+    if _MC2 is not None:
+        return _MC2
+    # Edge-cloud fallback: EP group already covers the same-side ranks,
+    # so reuse it as the MC2 communication group.
+    if is_edge_cloud_pp_mode():
+        from vllm.distributed.parallel_state import get_ep_group
+        return get_ep_group()
+    raise AssertionError("mc2 group is not initialized")
 
 
 def get_mlp_tp_group() -> GroupCoordinator:

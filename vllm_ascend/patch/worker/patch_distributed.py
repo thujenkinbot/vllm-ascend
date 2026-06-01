@@ -231,3 +231,53 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
 vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch
 _patch_destroy_distributed_environment()
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch EP group creation for edge-cloud mode.
+# In edge-cloud mode, EP groups must be split by side (edge vs cloud)
+# so that MoE all-to-all communication stays within each side.
+# This supports both head_tail and embedding_only modes.
+# ---------------------------------------------------------------------------
+
+_orig_init_model_parallel_group = vllm.distributed.parallel_state.init_model_parallel_group
+
+
+def _init_model_parallel_group_wrapper(
+    group_ranks,
+    local_rank,
+    backend,
+    use_message_queue_broadcaster=False,
+    group_name=None,
+    use_device_communicator=True,
+):
+    if group_name == "ep" and vllm.distributed.parallel_state.is_edge_cloud_pp_mode():
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            edge_npu_count = getattr(
+                vllm_config.parallel_config, "edge_npu_count", None
+            )
+            if edge_npu_count is not None:
+                world_size = torch.distributed.get_world_size()
+                edge_ranks = list(range(edge_npu_count))
+                cloud_ranks = list(range(edge_npu_count, world_size))
+                new_group_ranks = []
+                if edge_ranks:
+                    new_group_ranks.append(edge_ranks)
+                if cloud_ranks:
+                    new_group_ranks.append(cloud_ranks)
+                group_ranks = new_group_ranks
+
+    return _orig_init_model_parallel_group(
+        group_ranks,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=use_message_queue_broadcaster,
+        group_name=group_name,
+        use_device_communicator=use_device_communicator,
+    )
+
+
+vllm.distributed.parallel_state.init_model_parallel_group = _init_model_parallel_group_wrapper
