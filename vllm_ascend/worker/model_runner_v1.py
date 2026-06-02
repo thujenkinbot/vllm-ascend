@@ -530,7 +530,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
             hf_config = getattr(self.model_config, "hf_text_config", None)
             model_type = getattr(hf_config, "model_type", "")
+            outer_model_type = getattr(
+                getattr(self.model_config, "hf_config", None), "model_type", ""
+            )
             self._is_qwen3_5 = "qwen3_5" in model_type
+            self._is_deepseek_v2 = "deepseek" in model_type
+            self._is_kimi_k25 = "kimi_k25" in outer_model_type or "kimi_k25" in model_type
             self.num_layers = 0
             self.segment_a: Any = None
             self.segment_e: Any = None
@@ -542,6 +547,8 @@ class NPUModelRunner(GPUModelRunner):
             self.head_k = 0
             self.tail_k = 0
             self._is_qwen3_5 = False
+            self._is_deepseek_v2 = False
+            self._is_kimi_k25 = False
             if self.parallel_config.enable_edge_cloud:
                 raise ValueError(
                     "--enable-edge-cloud requires "
@@ -675,9 +682,10 @@ class NPUModelRunner(GPUModelRunner):
             dist_utils.get_pp_indices = orig_get_pp_indices
 
     def _load_model_edge_cloud(self) -> None:
-        if not self._is_qwen3_5:
+        if not (self._is_qwen3_5 or self._is_deepseek_v2 or self._is_kimi_k25):
             raise NotImplementedError(
-                "edge-cloud mode in this migration only supports Qwen3.5/Qwen3.5-MoE"
+                "edge-cloud mode currently supports Qwen3.5, DeepseekV2/V3, "
+                "and Kimi-K2.5/K2.6 models."
             )
 
         logger.info(
@@ -687,7 +695,12 @@ class NPUModelRunner(GPUModelRunner):
             self.head_k,
             self.tail_k,
         )
-        import vllm_ascend.patch.models.qwen3_5_edge_cloud  # noqa: F401
+        if self._is_qwen3_5:
+            import vllm_ascend.patch.models.qwen3_5_edge_cloud  # noqa: F401
+        if self._is_deepseek_v2:
+            import vllm_ascend.patch.models.deepseek_v2_edge_cloud  # noqa: F401
+        if self._is_kimi_k25:
+            import vllm_ascend.patch.models.kimi_k25_edge_cloud  # noqa: F401
 
         device_config = self.vllm_config.device_config
         load_config = self.vllm_config.load_config
@@ -3505,8 +3518,19 @@ class NPUModelRunner(GPUModelRunner):
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
-        super().profile_run()
-        self.max_num_tokens = origin_max_num_tokens
+        skip_mm_profile = (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "cloud"
+            and self.supports_mm_inputs
+        )
+        original_supports_mm_inputs = self.supports_mm_inputs
+        if skip_mm_profile:
+            self.supports_mm_inputs = False
+        try:
+            super().profile_run()
+        finally:
+            self.supports_mm_inputs = original_supports_mm_inputs
+            self.max_num_tokens = origin_max_num_tokens
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
