@@ -477,7 +477,7 @@ class NPUWorker(WorkerBase):
         if forward_pass:
             if is_cloud_device():
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-                if enable_sp():
+                if enable_sp() and self.model_runner.edge_cloud_cfg.mode != "embedding_only":
                     tensor_dict = {
                         k: sequence_parallel_chunk(v)
                         for k, v in tensor_dict.items()
@@ -519,7 +519,7 @@ class NPUWorker(WorkerBase):
         if is_edge_device():
             # Edge-cloud with heterogeneous SP: aggregate SP shards to full
             # sequence before cross-PP send so cloud can re-chunk by its SP.
-            if enable_sp():
+            if enable_sp() and self.model_runner.edge_cloud_cfg.mode != "embedding_only":
                 output.tensors = self._all_gather_tensor_dict(output.tensors)
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)

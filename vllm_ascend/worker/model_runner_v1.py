@@ -2990,11 +2990,24 @@ class NPUModelRunner(GPUModelRunner):
                 "sync_and_slice_intermediate_tensors received None; "
                 "check PP/TP tensor delivery."
             )
-            for k, v in intermediate_tensors.items():
-                copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
-                self.intermediate_tensors[k][:copy_len].copy_(
-                    v[:copy_len], non_blocking=True
+            if self._edge_cloud_enabled and self.edge_cloud_cfg.role == "cloud" and self.edge_cloud_cfg.mode == "embedding_only":
+                for k, v in intermediate_tensors.items():
+                    copy_len = num_tokens
+                    self.intermediate_tensors[k][:copy_len].copy_(
+                        v[:copy_len], non_blocking=True
+                    )
+                return IntermediateTensors(
+                    {
+                        k: v[:num_tokens]
+                        for k, v in self.intermediate_tensors.items()
+                    }
                 )
+            else:
+                for k, v in intermediate_tensors.items():
+                    copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
+                    self.intermediate_tensors[k][:copy_len].copy_(
+                        v[:copy_len], non_blocking=True
+                    )
 
         return IntermediateTensors(
             {
