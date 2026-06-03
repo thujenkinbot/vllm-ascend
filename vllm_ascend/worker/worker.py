@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
@@ -424,6 +425,40 @@ class NPUWorker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    def _all_gather_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """All-gather tensors across the local TP group along sequence dim.
+
+        Used in edge-cloud mode when edge and cloud have different SP sizes.
+        Before cross-PP send, each side must aggregate its SP shards back to
+        the full sequence so the remote side can re-chunk with its own SP size.
+        """
+        tp_group = get_tp_group()
+        pc = self.vllm_config.parallel_config
+        # In edge-cloud mode, ensure the all-gathered length is also padded to
+        # the remote side's TP size so no extra padding is needed after recv.
+        target_tp_size = None
+        if pc.enable_edge_cloud:
+            target_tp_size = pc.cloud_npu_count if pc.is_edge_node else pc.edge_npu_count
+
+        result = {}
+        for key, tensor in tensor_dict.items():
+            if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                gathered = tp_group.all_gather(tensor, dim=0)
+                # Pad sequence to target_tp_size if heterogeneous SP is used
+                if target_tp_size is not None and target_tp_size > 1:
+                    seq_len = gathered.size(0)
+                    remainder = seq_len % target_tp_size
+                    if remainder != 0:
+                        pad_len = target_tp_size - remainder
+                        gathered = torch.nn.functional.pad(gathered, (0, 0, 0, pad_len))
+                result[key] = gathered
+            else:
+                result[key] = tensor
+        return result
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -442,6 +477,11 @@ class NPUWorker(WorkerBase):
         if forward_pass:
             if is_cloud_device():
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                if enable_sp():
+                    tensor_dict = {
+                        k: sequence_parallel_chunk(v)
+                        for k, v in tensor_dict.items()
+                    }
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -477,9 +517,18 @@ class NPUWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         if is_edge_device():
+            # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+            # sequence before cross-PP send so cloud can re-chunk by its SP.
+            if enable_sp():
+                output.tensors = self._all_gather_tensor_dict(output.tensors)
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            if enable_sp():
+                tensor_dict = {
+                    k: sequence_parallel_chunk(v)
+                    for k, v in tensor_dict.items()
+                }
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -493,6 +542,10 @@ class NPUWorker(WorkerBase):
             return output
 
         if is_cloud_device():
+            # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+            # sequence before cross-PP send so edge can re-chunk by its SP.
+            if enable_sp():
+                output.tensors = self._all_gather_tensor_dict(output.tensors)
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
         else:
