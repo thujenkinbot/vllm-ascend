@@ -155,6 +155,14 @@ class NPUWorker(WorkerBase):
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
 
+        # Per-request timing accumulators
+        self._req_active = False
+        self._req_start_time: float = 0.0
+        self._req_step_count: int = 0
+        self._req_fwd_ms: float = 0.0
+        self._req_sample_ms: float = 0.0
+        self._req_transfer_ms: float = 0.0
+
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
             # Prevent duplicate triggers, execute the exit logic only once
@@ -445,17 +453,33 @@ class NPUWorker(WorkerBase):
         _is_edge = forward_pass and is_edge_device()
         _is_cloud = forward_pass and is_cloud_device()
 
+        # --- request-level tracking ---
+        if forward_pass:
+            if not self._req_active:
+                self._req_active = True
+                self._req_start_time = time.perf_counter()
+                self._req_step_count = 0
+                self._req_fwd_ms = 0.0
+                self._req_sample_ms = 0.0
+                self._req_transfer_ms = 0.0
+        else:
+            if self._req_active:
+                self._log_request_summary()
+                self._req_active = False
+            return self._execute_model_noop(scheduler_output)
+
         if forward_pass:
             if _is_cloud:
                 _t = time.perf_counter()
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-                logger.info("[edge-cloud timing] cloud recv from edge: %.2f ms",
-                            (time.perf_counter() - _t) * 1000)
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
                     comm_postprocess=comm_postprocess,
                 )
+                intermediate_tensors.wait_for_comm()
+                logger.info("[edge-cloud timing] cloud recv from edge (synced): %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
             elif not get_pp_group().is_first_rank:
                 # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
                 # it will conflict with the all-gather operation in flashcomm1.
@@ -481,14 +505,17 @@ class NPUWorker(WorkerBase):
 
         _t_fwd_start = time.perf_counter()
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-        _t_fwd_end = time.perf_counter()
+        torch.npu.synchronize()
+        _t_fwd_ms = (time.perf_counter() - _t_fwd_start) * 1000
         if _is_edge:
-            logger.info("[edge-cloud timing] edge segment_a (head) forward: %.2f ms",
-                        (_t_fwd_end - _t_fwd_start) * 1000)
+            logger.info("[edge-cloud timing] edge segment_a (head) forward: %.2f ms", _t_fwd_ms)
         elif _is_cloud:
-            logger.info("[edge-cloud timing] cloud segment_c (center) forward: %.2f ms",
-                        (_t_fwd_end - _t_fwd_start) * 1000)
+            logger.info("[edge-cloud timing] cloud segment_c (center) forward: %.2f ms", _t_fwd_ms)
+        else:
+            logger.info("[baseline timing] full model forward: %.2f ms", _t_fwd_ms)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            self._req_fwd_ms += _t_fwd_ms
+            self._req_step_count += 1
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -503,25 +530,34 @@ class NPUWorker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
-            # 确保 HCCL 回传数据在 NPU 上可用后再启动 segment_e forward
+            intermediate_tensors.wait_for_comm()
             torch.npu.synchronize()
-            logger.info("[edge-cloud timing] edge→cloud send + cloud forward + cloud→edge recv + sync: %.2f ms",
-                        (time.perf_counter() - _t_transfer) * 1000)
+            _transfer_ms = (time.perf_counter() - _t_transfer) * 1000
+            logger.info("[edge-cloud timing] edge→cloud send + cloud forward + cloud→edge recv (synced): %.2f ms",
+                        _transfer_ms)
             _t_tail_start = time.perf_counter()
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-            logger.info("[edge-cloud timing] edge segment_e (tail) forward: %.2f ms",
-                        (time.perf_counter() - _t_tail_start) * 1000)
+            torch.npu.synchronize()
+            _tail_ms = (time.perf_counter() - _t_tail_start) * 1000
+            logger.info("[edge-cloud timing] edge segment_e (tail) forward: %.2f ms", _tail_ms)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+                self._req_fwd_ms += _t_fwd_ms + _tail_ms
+                self._req_transfer_ms += _transfer_ms
+                self._req_step_count += 1
                 return output
             logger.info("[edge-cloud timing] === edge total per step: %.2f ms ===",
-                        (time.perf_counter() - _t_fwd_start) * 1000)
+                        _t_fwd_ms + _transfer_ms + _tail_ms)
+            self._req_fwd_ms += _t_fwd_ms + _tail_ms
+            self._req_transfer_ms += _transfer_ms
+            self._req_step_count += 1
             return output
 
         if is_cloud_device():
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
-            logger.info("[edge-cloud timing] === cloud total per step: %.2f ms ===",
-                        (time.perf_counter() - _t_fwd_start) * 1000)
+            logger.info("[edge-cloud timing] === cloud total per step: %.2f ms ===", _t_fwd_ms)
+            self._req_fwd_ms += _t_fwd_ms
+            self._req_step_count += 1
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
@@ -549,7 +585,30 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        _t = time.perf_counter()
+        out = self.model_runner.sample_tokens(grammar_output)
+        torch.npu.synchronize()
+        _sample_ms = (time.perf_counter() - _t) * 1000
+        logger.info("[timing] sample_tokens: %.2f ms", _sample_ms)
+        if self._req_active:
+            self._req_sample_ms += _sample_ms
+        return out
+
+    def _execute_model_noop(self, scheduler_output: "SchedulerOutput"):
+        """Forward to model_runner when no tokens to schedule (noop step)."""
+        if self.profiler is not None:
+            self.profiler.step()
+        return self.model_runner.execute_model(scheduler_output, None)
+
+    def _log_request_summary(self):
+        total_wall_ms = (time.perf_counter() - self._req_start_time) * 1000
+        role = "edge" if is_edge_device() else ("cloud" if is_cloud_device() else "baseline")
+        logger.info(
+            "[request summary] role=%s | steps=%d | wall=%.2f ms | "
+            "fwd=%.2f ms | sample=%.2f ms | transfer=%.2f ms",
+            role, self._req_step_count, total_wall_ms,
+            self._req_fwd_ms, self._req_sample_ms, self._req_transfer_ms,
+        )
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
