@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import time
 from types import NoneType
 
 import torch
@@ -28,6 +29,8 @@ import torch_npu
 import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
+
+logger = logging.getLogger("vllm_ascend.edge_cloud_timing")
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
@@ -439,9 +442,15 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        _is_edge = forward_pass and is_edge_device()
+        _is_cloud = forward_pass and is_cloud_device()
+
         if forward_pass:
-            if is_cloud_device():
+            if _is_cloud:
+                _t = time.perf_counter()
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                logger.info("[edge-cloud timing] cloud recv from edge: %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -470,7 +479,15 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        _t_fwd_start = time.perf_counter()
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        _t_fwd_end = time.perf_counter()
+        if _is_edge:
+            logger.info("[edge-cloud timing] edge segment_a (head) forward: %.2f ms",
+                        (_t_fwd_end - _t_fwd_start) * 1000)
+        elif _is_cloud:
+            logger.info("[edge-cloud timing] cloud segment_c (center) forward: %.2f ms",
+                        (_t_fwd_end - _t_fwd_start) * 1000)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -479,6 +496,7 @@ class NPUWorker(WorkerBase):
         if is_edge_device():
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            _t_transfer = time.perf_counter()
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -487,14 +505,23 @@ class NPUWorker(WorkerBase):
             )
             # 确保 HCCL 回传数据在 NPU 上可用后再启动 segment_e forward
             torch.npu.synchronize()
+            logger.info("[edge-cloud timing] edge→cloud send + cloud forward + cloud→edge recv + sync: %.2f ms",
+                        (time.perf_counter() - _t_transfer) * 1000)
+            _t_tail_start = time.perf_counter()
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+            logger.info("[edge-cloud timing] edge segment_e (tail) forward: %.2f ms",
+                        (time.perf_counter() - _t_tail_start) * 1000)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
                 return output
+            logger.info("[edge-cloud timing] === edge total per step: %.2f ms ===",
+                        (time.perf_counter() - _t_fwd_start) * 1000)
             return output
 
         if is_cloud_device():
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            logger.info("[edge-cloud timing] === cloud total per step: %.2f ms ===",
+                        (time.perf_counter() - _t_fwd_start) * 1000)
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
