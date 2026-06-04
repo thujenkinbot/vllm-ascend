@@ -1938,7 +1938,11 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
+                _t = time.perf_counter()
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
+                torch.npu.synchronize()
+                logger.info("[model runner]   _update_states: %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1978,6 +1982,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
+                _t = time.perf_counter()
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -1986,6 +1991,9 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                torch.npu.synchronize()
+                logger.info("[model runner]   _prepare_inputs: %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
@@ -2000,6 +2008,7 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                _t = time.perf_counter()
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -2015,6 +2024,8 @@ class NPUModelRunner(GPUModelRunner):
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                logger.info("[model runner]   _determine_batch: %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -2083,6 +2094,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
                     )
 
+                _t = time.perf_counter()
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
@@ -2098,7 +2110,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                torch.npu.synchronize()
+                logger.info("[model runner]   _build_attention_metadata: %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
 
+            _t = time.perf_counter()
             (
                 input_ids,
                 inputs_embeds,
@@ -2113,6 +2129,9 @@ class NPUModelRunner(GPUModelRunner):
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
             )
+            torch.npu.synchronize()
+            logger.info("[model runner]   _preprocess: %.2f ms",
+                        (time.perf_counter() - _t) * 1000)
 
             # update global cos, sin
             update_cos_sin(positions)

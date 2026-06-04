@@ -480,6 +480,7 @@ class NPUWorker(WorkerBase):
                     comm_postprocess=comm_postprocess,
                 )
                 intermediate_tensors.wait_for_comm()
+                torch.npu.synchronize()
                 logger.info("[edge-cloud timing] cloud recv from edge (synced): %.2f ms",
                             (time.perf_counter() - _t) * 1000)
             elif _is_pp_recv:
