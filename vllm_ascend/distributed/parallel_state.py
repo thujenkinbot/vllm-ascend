@@ -57,13 +57,23 @@ def init_ascend_model_parallel(
         backend = torch.distributed.get_backend(get_world_group().device_group)
         edge_npu_count = parallel_config.edge_npu_count
         cloud_npu_count = parallel_config.cloud_npu_count
-        world_size_per_instance = edge_npu_count + cloud_npu_count
-        ep_edge_ranks = []
-        ep_cloud_ranks = []
-        for dp_idx in range(parallel_config.data_parallel_size):
-            base = dp_idx * world_size_per_instance
-            ep_edge_ranks.extend(range(base, base + edge_npu_count))
-            ep_cloud_ranks.extend(range(base + edge_npu_count, base + world_size_per_instance))
+        if parallel_config.is_shared_model_edge:
+            # Shared-model edge-cloud topology: the edge has a
+            # single distributed rank (rank 0) and the cloud
+            # occupies ranks 1..1 + N*C.
+            ep_edge_ranks = [0]
+            ep_cloud_ranks = list(
+                range(1,
+                      1 + parallel_config.data_parallel_size * cloud_npu_count))
+        else:
+            world_size_per_instance = edge_npu_count + cloud_npu_count
+            ep_edge_ranks = []
+            ep_cloud_ranks = []
+            for dp_idx in range(parallel_config.data_parallel_size):
+                base = dp_idx * world_size_per_instance
+                ep_edge_ranks.extend(range(base, base + edge_npu_count))
+                ep_cloud_ranks.extend(
+                    range(base + edge_npu_count, base + world_size_per_instance))
         _MC2 = init_model_parallel_group(
             [ep_edge_ranks, ep_cloud_ranks],
             get_world_group().local_rank,
@@ -389,18 +399,39 @@ def destroy_ascend_model_parallel():
     _DYNAMIC_EPLB = None
 
 
-def edge_cloud_broadcast_recv() -> tuple[
+def edge_cloud_broadcast_recv(
+    src: int | None = None,
+) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
+    """Receive PP tensors and broadcast them within the local edge/cloud TP group.
+
+    Args:
+        src: optional explicit source rank (in-group index) for the
+            PP receive. When ``None`` (the default), the upstream
+            vLLM
+            :meth:`GroupCoordinator.irecv_tensor_dict` falls back to
+            the implicit "previous PP rank" routing — the original
+            behaviour of this function. Pass an explicit rank when
+            the caller needs to receive from a specific peer (e.g.
+            the shared-model edge worker, where multiple virtual
+            workers share a single distributed rank and each one
+            communicates with a different cloud peer based on
+            ``local_rank``). The parameter is only consulted when
+            the local PP group is the PP pair (i.e. it participates
+            in the PP receive); the singleton-PP TP-broadcast-only
+            branch is unchanged.
+    """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    is_pp_npu0 = pp_group.world_size == 2
+    is_pp_npu0 = pp_group.world_size > 1
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        tensor_dict, comm_handles, comm_postprocess = (
+            pp_group.irecv_tensor_dict(src=src)
+        )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "
             "sender may have failed."
