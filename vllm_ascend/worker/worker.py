@@ -452,6 +452,8 @@ class NPUWorker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         _is_edge = forward_pass and is_edge_device()
         _is_cloud = forward_pass and is_cloud_device()
+        _is_pp_recv = (forward_pass and not _is_cloud
+                       and not get_pp_group().is_first_rank)
 
         # --- request-level tracking ---
         if forward_pass:
@@ -480,7 +482,8 @@ class NPUWorker(WorkerBase):
                 intermediate_tensors.wait_for_comm()
                 logger.info("[edge-cloud timing] cloud recv from edge (synced): %.2f ms",
                             (time.perf_counter() - _t) * 1000)
-            elif not get_pp_group().is_first_rank:
+            elif _is_pp_recv:
+                _t = time.perf_counter()
                 # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
                 # it will conflict with the all-gather operation in flashcomm1.
                 if enable_sp():
@@ -499,6 +502,10 @@ class NPUWorker(WorkerBase):
                     comm_handles=comm_handles,
                     comm_postprocess=comm_postprocess,
                 )
+                intermediate_tensors.wait_for_comm()
+                torch.npu.synchronize()
+                _pp_recv_ms = (time.perf_counter() - _t) * 1000
+                logger.info("[pp timing] recv from prev stage (synced): %.2f ms", _pp_recv_ms)
 
         if self.profiler is not None:
             self.profiler.step()
@@ -511,11 +518,17 @@ class NPUWorker(WorkerBase):
             logger.info("[edge-cloud timing] edge segment_a (head) forward: %.2f ms", _t_fwd_ms)
         elif _is_cloud:
             logger.info("[edge-cloud timing] cloud segment_c (center) forward: %.2f ms", _t_fwd_ms)
+        elif _is_pp_recv:
+            logger.info("[pp timing] last stage forward: %.2f ms", _t_fwd_ms)
         else:
-            logger.info("[baseline timing] full model forward: %.2f ms", _t_fwd_ms)
+            logger.info("[pp timing] first stage forward: %.2f ms", _t_fwd_ms)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             self._req_fwd_ms += _t_fwd_ms
+            self._req_transfer_ms += _pp_recv_ms if _is_pp_recv else 0.0
             self._req_step_count += 1
+            if _is_pp_recv:
+                logger.info("[pp timing] === last stage total per step: %.2f ms ===",
+                            _pp_recv_ms + _t_fwd_ms)
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -566,10 +579,22 @@ class NPUWorker(WorkerBase):
                 all_gather_group = None
             else:
                 all_gather_group = get_tp_group()
+            _t_send = time.perf_counter()
             self._pp_send_work = get_pp_group().isend_tensor_dict(
                 output.tensors,
                 all_gather_group=all_gather_group,
             )
+            for handle in self._pp_send_work:
+                handle.wait()
+            torch.npu.synchronize()
+            self._pp_send_work = []
+            _pp_send_ms = (time.perf_counter() - _t_send) * 1000
+            logger.info("[pp timing] send to next stage (synced): %.2f ms", _pp_send_ms)
+            logger.info("[pp timing] === first stage total per step: %.2f ms ===",
+                        _t_fwd_ms + _pp_send_ms)
+            self._req_fwd_ms += _t_fwd_ms
+            self._req_transfer_ms += _pp_send_ms
+            self._req_step_count += 1
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
@@ -602,7 +627,14 @@ class NPUWorker(WorkerBase):
 
     def _log_request_summary(self):
         total_wall_ms = (time.perf_counter() - self._req_start_time) * 1000
-        role = "edge" if is_edge_device() else ("cloud" if is_cloud_device() else "baseline")
+        if is_edge_device():
+            role = "edge"
+        elif is_cloud_device():
+            role = "cloud"
+        elif get_pp_group().world_size > 1:
+            role = "pp-stage"
+        else:
+            role = "baseline"
         logger.info(
             "[request summary] role=%s | steps=%d | wall=%.2f ms | "
             "fwd=%.2f ms | sample=%.2f ms | transfer=%.2f ms",

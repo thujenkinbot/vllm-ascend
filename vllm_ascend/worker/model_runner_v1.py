@@ -1915,6 +1915,7 @@ class NPUModelRunner(GPUModelRunner):
         )):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        _t_prep_start = time.perf_counter()
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
@@ -2116,6 +2117,10 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
+        torch.npu.synchronize()
+        logger.info("[model runner] prepare input: %.2f ms",
+                    (time.perf_counter() - _t_prep_start) * 1000)
+
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -2141,6 +2146,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        _t_fwd_start = time.perf_counter()
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2165,6 +2171,10 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        torch.npu.synchronize()
+        logger.info("[model runner] forward: %.2f ms",
+                    (time.perf_counter() - _t_fwd_start) * 1000)
+        _t_post_start = time.perf_counter()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2189,6 +2199,9 @@ class NPUModelRunner(GPUModelRunner):
                 if self.debugger is not None:
                     self.debugger.stop()
                     self.debugger.step()
+                torch.npu.synchronize()
+                logger.info("[model runner] post process (early return): %.2f ms",
+                            (time.perf_counter() - _t_post_start) * 1000)
                 return hidden_states
 
             if not self.broadcast_pp_output:
@@ -2202,6 +2215,9 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
+                    torch.npu.synchronize()
+                    logger.info("[model runner] post process (edge head early return): %.2f ms",
+                                (time.perf_counter() - _t_post_start) * 1000)
                     return hidden_states
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
@@ -2209,6 +2225,9 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
+                    torch.npu.synchronize()
+                    logger.info("[model runner] post process (pp early return): %.2f ms",
+                                (time.perf_counter() - _t_post_start) * 1000)
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -2258,6 +2277,10 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self.kv_connector_output = kv_connector_output
+
+        torch.npu.synchronize()
+        logger.info("[model runner] post process (logits + state): %.2f ms",
+                    (time.perf_counter() - _t_post_start) * 1000)
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
@@ -2821,12 +2844,16 @@ class NPUModelRunner(GPUModelRunner):
                         layer_indices=list(range(0, self.head_k)),
                         graph_wrapper=seg_a,
                     )
+                _t = time.perf_counter()
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                torch.npu.synchronize()
+                logger.info("[model runner] segment_a layers: %.2f ms",
+                            (time.perf_counter() - _t) * 1000)
             finally:
                 # 恢复 layer_idx 前先同步当前流，确保 weight_prefetch 等
                 # 依赖 layer_idx 的异步任务已在正确层号下完成，防止后续段读到错层权重
@@ -2863,11 +2890,15 @@ class NPUModelRunner(GPUModelRunner):
                     layer_indices=tail_layer_indices,
                     graph_wrapper=seg_e,
                 )
+            _t = time.perf_counter()
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            torch.npu.synchronize()
+            logger.info("[model runner] segment_e layers: %.2f ms",
+                        (time.perf_counter() - _t) * 1000)
         finally:
             # segment_e 执行完毕后恢复原始 layer_idx
             if old_layer_idx is not None:
@@ -2922,11 +2953,15 @@ class NPUModelRunner(GPUModelRunner):
                     layer_indices=cloud_layer_indices,
                     graph_wrapper=seg_c,
                 )
+            _t = time.perf_counter()
             hidden_states = seg_c(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            torch.npu.synchronize()
+            logger.info("[model runner] segment_c layers: %.2f ms",
+                        (time.perf_counter() - _t) * 1000)
         finally:
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx
