@@ -520,7 +520,9 @@ class NPUWorker(WorkerBase):
             # Edge-cloud with heterogeneous SP: aggregate SP shards to full
             # sequence before cross-PP send so cloud can re-chunk by its SP.
             if enable_sp() and self.model_runner.edge_cloud_cfg.mode != "embedding_only":
-                output.tensors = self._all_gather_tensor_dict(output.tensors)
+                _gathered = self._all_gather_tensor_dict(output.tensors)
+            else:
+                _gathered = output.tensors
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
@@ -545,9 +547,11 @@ class NPUWorker(WorkerBase):
             # Edge-cloud with heterogeneous SP: aggregate SP shards to full
             # sequence before cross-PP send so edge can re-chunk by its SP.
             if enable_sp():
-                output.tensors = self._all_gather_tensor_dict(output.tensors)
+                _gathered = self._all_gather_tensor_dict(output.tensors)
+            else:
+                _gathered = output.tensors
             if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+                self._pp_send_work = get_pp_group().isend_tensor_dict(_gathered)
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
