@@ -524,7 +524,7 @@ class NPUWorker(WorkerBase):
             else:
                 _gathered = output.tensors
             if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+                self._pp_send_work = get_pp_group().isend_tensor_dict(_gathered)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             if enable_sp():
                 tensor_dict = {
