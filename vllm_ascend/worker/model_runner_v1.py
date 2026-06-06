@@ -3611,14 +3611,16 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     # Cloud 端：需要中间张量
                     intermediate_tokens = num_tokens_padded
-                    if enable_sp():
-                        # 如果启用序列并行（SP），token 数需要除以 tp_size（向上取整）
+                    # embedding-only 模式下 Cloud 从首层开始执行，输入来自 Edge 的
+                    # embedding 输出，应为完整序列长度（运行时
+                    # sync_and_slice_intermediate_tensors 亦使用完整 num_tokens）。
+                    if enable_sp() and self.edge_cloud_cfg.mode != "embedding_only":
                         tp_size = get_tensor_model_parallel_world_size()
                         intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
                     if self.intermediate_tensors is None:
                         # 首次创建 intermediate_tensors，使用最大可能 token 数
                         max_actual_tokens = self.max_num_tokens
-                        if enable_sp():
+                        if enable_sp() and self.edge_cloud_cfg.mode != "embedding_only":
                             max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
                         # 调用模型方法创建空的中间张量
                         self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
