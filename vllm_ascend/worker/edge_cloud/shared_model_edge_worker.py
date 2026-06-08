@@ -84,6 +84,75 @@ def get_leader_worker() -> "SharedModelEdgeWorker | None":
             return w
     return None
 
+class DeferredExecutePostprocess(AsyncModelRunnerOutput):
+    """Marker returned by
+    :meth:`SharedModelEdgeWorker.execute_model` indicating that
+    the tail recv + tail forward is deferred to the end of the
+    current round.
+
+    The class is both an :class:`AsyncModelRunnerOutput` *and*
+    a :class:`collections.abc.Callable` — the
+    :class:`vllm.v1.executor.shared_model_multiproc_executor.SharedModelWorkerProc`
+    detects markers via the conjunction
+    ``isinstance(output, AsyncModelRunnerOutput) and callable(output)``
+    and accumulates them in ``self._pending_deferred``,
+    invoking ``get_output()`` at the round boundary (which
+    runs the postprocess and writes the final result to
+    ``response_mqs[dp_rank]``).
+
+    Two call surfaces are supported:
+
+    * :meth:`get_output` — the path the WorkerProc takes via
+      :meth:`vllm.v1.executor.shared_model_multiproc_executor.SharedModelWorkerProc.enqueue_output`.
+      After running the postprocess, it does **one more type
+      check** on the result: if the postprocess happens to
+      return another :class:`AsyncModelRunnerOutput` (e.g. a
+      future from a nested deferred step), it is unwrapped via
+      ``result.get_output()`` recursively. The result the
+      WorkerProc sees is therefore guaranteed to be a
+      ``ModelRunnerOutput`` / ``None`` / ``IntermediateTensors``
+      / ``Exception``, never a still-deferred object.
+
+    * :meth:`__call__` — the direct-call path. The postprocess
+      is run and the raw result is returned **without any
+      type check**. This is what other code (e.g. unit tests
+      or hand-rolled drivers) gets when it bypasses the
+      WorkerProc's enqueue_output unwrap and simply calls the
+      marker.
+    """
+
+    __slots__ = ("postprocess",)
+
+    def __init__(self, postprocess) -> None:
+        # ``postprocess`` is a zero-argument callable produced
+        # by ``execute_model``. When invoked it runs the tail
+        # recv + tail forward and returns the raw result with
+        # signature ``ModelRunnerOutput | AsyncModelRunnerOutput
+        # | IntermediateTensors | None``.
+        self.postprocess = postprocess
+
+    def __call__(self):
+        # Direct call: run the postprocess and hand the raw
+        # result back to the caller with no further
+        # processing. This is the "shortcut" path: it is the
+        # caller's responsibility to deal with the result
+        # type.
+        return self.postprocess()
+
+    def get_output(self):
+        # WorkerProc path. Run the postprocess, then do one
+        # more type check on the result: if the postprocess
+        # itself returned a nested
+        # :class:`AsyncModelRunnerOutput` (e.g. a still-deferred
+        # future), unwrap it via its own ``get_output()``.
+        # ``enqueue_output`` downstream treats this return
+        # value as a "ready" output and writes it straight to
+        # the response MQ.
+        result = self.postprocess()
+        if isinstance(result, AsyncModelRunnerOutput):
+            result = result.get_output()
+        return result
+
 
 class SharedModelEdgeWorker(NPUWorker):
     """Edge worker that shares one ``nn.Module`` across virtual DP workers.
@@ -245,6 +314,21 @@ class SharedModelEdgeWorker(NPUWorker):
         argument (the shared-model edge worker cannot rely on the
         implicit "previous PP rank" routing — each virtual worker
         has its own cloud peer based on ``local_rank``).
+
+        The head forward + PP send is performed synchronously;
+        the tail recv + tail forward is wrapped into a zero-
+        argument callable (a closure over ``self`` and
+        ``scheduler_output``) and returned in lieu of the final
+        result. The
+        :class:`vllm.v1.executor.shared_model_multiproc_executor.SharedModelWorkerProc`
+        accumulates these callables across dp_ranks and invokes
+        them in batch when the round barrier is reached (just
+        before the result is enqueued onto the response MQ), so
+        per-dp_rank tail processing stays in lockstep. The
+        ``method == "execute_model"`` filter on the dispatch
+        side keeps the callable-detection unambiguous: no other
+        return value of any ``SharedModelEdgeWorker`` method is
+        a plain function.
         """
         from types import NoneType
         from vllm.sequence import IntermediateTensors
@@ -263,9 +347,6 @@ class SharedModelEdgeWorker(NPUWorker):
                 handle.wait()
             self._pp_send_work = []
 
-        intermediate_tensors = None
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-
         # SharedModelEdgeWorker always sits at PP rank 0 (the edge is
         # the first stage of the shared PP group), so there is no
         # upstream PP receive before the first forward.
@@ -273,8 +354,7 @@ class SharedModelEdgeWorker(NPUWorker):
         if self.profiler is not None:
             self.profiler.step()
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+        output = self.model_runner.execute_model(scheduler_output, None)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput,
                                NoneType)):
             return output
@@ -290,28 +370,43 @@ class SharedModelEdgeWorker(NPUWorker):
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors, dst=self.local_rank + 1)
 
-        # Receive the cloud's middle-layer result and run the second
-        # forward (tail layers). The cloud peer is at in-group rank
-        # ``self.local_rank + 1``.
-        tensor_dict, comm_handles, comm_postprocess = (
-            edge_cloud_broadcast_recv(src=self.local_rank + 1))
-        intermediate_tensors = AsyncIntermediateTensors(
-            tensor_dict,
-            comm_handles=comm_handles,
-            comm_postprocess=comm_postprocess,
-        )
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
-        if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput,
-                               NoneType)):
-            return output
+        # Defer the tail recv + tail forward to the end of the
+        # current round. The WorkerProc accumulates these
+        # callables in ``_pending_deferred`` and invokes them
+        # in batch (one ``postprocess()`` per dp_rank) when the
+        # round barrier is reached, just before the result is
+        # enqueued onto ``response_mqs[dp_rank]``. This keeps
+        # the per-dp_rank streams in lockstep — the cloud's
+        # middle forward can run concurrently with the edge's
+        # head forwards for subsequent dp_ranks, and the edge's
+        # tail recvs happen in lockstep with the round
+        # boundary.
+        def _tail_postprocess():
+            # Receive the cloud's middle-layer result and run
+            # the second forward (tail layers). The cloud peer
+            # is at in-group rank ``self.local_rank + 1``.
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv(src=self.local_rank + 1))
+            intermediate_tensors = AsyncIntermediateTensors(
+                tensor_dict,
+                comm_handles=comm_handles,
+                comm_postprocess=comm_postprocess,
+            )
+            tail_output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors)
+            if isinstance(tail_output,
+                          (ModelRunnerOutput, AsyncModelRunnerOutput,
+                           NoneType)):
+                return tail_output
+            # Edge path in the original NPUWorker.execute_model
+            # always returns after the second forward — the
+            # trailing KV-connector passthrough is for non-edge/
+            # non-cloud middle PP stages, which never run for
+            # SharedModelEdgeWorker.
+            assert isinstance(tail_output, IntermediateTensors)
+            return tail_output
 
-        assert isinstance(output, IntermediateTensors)
-        # Edge path in the original NPUWorker.execute_model always
-        # returns after the second forward — the trailing KV-
-        # connector passthrough is for non-edge/non-cloud middle PP
-        # stages, which never run for SharedModelEdgeWorker.
-        return output
+        return DeferredExecutePostprocess(postprocess=_tail_postprocess)
 
     # ------------------------------------------- memory / compile / warmup
     @torch.inference_mode()
