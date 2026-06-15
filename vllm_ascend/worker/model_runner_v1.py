@@ -2963,6 +2963,11 @@ class NPUModelRunner(GPUModelRunner):
         # enabled collective fusion for SP
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if enable_sp(self.vllm_config) or enable_sp_by_pass():
+            pc = self.vllm_config.parallel_config
+            # Edge-cloud mode: edge node should pad to cloud's tp_size so that
+            # the full sequence after all_gather is directly chunkable by cloud SP.
+            if pc.enable_edge_cloud and pc.is_edge_node:
+                tp_size = max(tp_size, pc.cloud_npu_count)
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
@@ -2985,11 +2990,24 @@ class NPUModelRunner(GPUModelRunner):
                 "sync_and_slice_intermediate_tensors received None; "
                 "check PP/TP tensor delivery."
             )
-            for k, v in intermediate_tensors.items():
-                copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
-                self.intermediate_tensors[k][:copy_len].copy_(
-                    v[:copy_len], non_blocking=True
+            if self._edge_cloud_enabled and self.edge_cloud_cfg.role == "cloud" and self.edge_cloud_cfg.mode == "embedding_only":
+                for k, v in intermediate_tensors.items():
+                    copy_len = num_tokens
+                    self.intermediate_tensors[k][:copy_len].copy_(
+                        v[:copy_len], non_blocking=True
+                    )
+                return IntermediateTensors(
+                    {
+                        k: v[:num_tokens]
+                        for k, v in self.intermediate_tensors.items()
+                    }
                 )
+            else:
+                for k, v in intermediate_tensors.items():
+                    copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
+                    self.intermediate_tensors[k][:copy_len].copy_(
+                        v[:copy_len], non_blocking=True
+                    )
 
         return IntermediateTensors(
             {
@@ -3593,14 +3611,16 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     # Cloud 端：需要中间张量
                     intermediate_tokens = num_tokens_padded
-                    if enable_sp():
-                        # 如果启用序列并行（SP），token 数需要除以 tp_size（向上取整）
+                    # embedding-only 模式下 Cloud 从首层开始执行，输入来自 Edge 的
+                    # embedding 输出，应为完整序列长度（运行时
+                    # sync_and_slice_intermediate_tensors 亦使用完整 num_tokens）。
+                    if enable_sp() and self.edge_cloud_cfg.mode != "embedding_only":
                         tp_size = get_tensor_model_parallel_world_size()
                         intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
                     if self.intermediate_tensors is None:
                         # 首次创建 intermediate_tensors，使用最大可能 token 数
                         max_actual_tokens = self.max_num_tokens
-                        if enable_sp():
+                        if enable_sp() and self.edge_cloud_cfg.mode != "embedding_only":
                             max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
                         # 调用模型方法创建空的中间张量
                         self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
