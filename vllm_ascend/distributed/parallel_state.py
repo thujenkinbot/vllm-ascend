@@ -2,6 +2,7 @@ from typing import Any, Callable
 
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
+from vllm.v1.core.sched.output import HiddenChannelType
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     Handle,
@@ -63,6 +64,15 @@ def init_ascend_model_parallel(
             backend,
             group_name="mc2",
         )
+
+        # Phase6 hidden data-plane channels are still required in edge-cloud
+        # mode.  The default PP group is PREFILL_1, the alternate PP group is
+        # DECODE, and the extra hidden-channel group is PREFILL_2.
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1:
+            pp_group.create_alternate_groups(backend)
+            if hasattr(pp_group, "create_hidden_channel_groups"):
+                pp_group.create_hidden_channel_groups(backend)
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow
@@ -266,6 +276,21 @@ def init_ascend_model_parallel(
             tp_group_ranks = all_ranks.view(-1, global_tp_size)
             _SHARD_WEIGHT = create_shard_weight_group(tp_group_ranks)
 
+    # Create alternate PP groups for dual-channel communication.
+    # Primary (device_group/cpu_group): used for non-ALL_DECODE batches
+    #   (ALL_PREFILL + PREFILL_DECODE_MIXED).
+    # Alternate (alt_device_group/alt_cpu_group): used for ALL_DECODE batches.
+    # Both groups cover the same PP ranks but are independent ProcessGroup
+    # instances, allowing the HCCL backend to maintain separate communication
+    # streams and avoid head-of-line blocking between decode and
+    # prefill/mixed traffic.
+    if global_pp_size > 1:
+        pp_group = get_pp_group()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        pp_group.create_alternate_groups(backend)
+        if hasattr(pp_group, "create_hidden_channel_groups"):
+            pp_group.create_hidden_channel_groups(backend)
+
 
 def model_parallel_initialized():
     return _MC2 is not None
@@ -382,18 +407,55 @@ def destroy_ascend_model_parallel():
     _DYNAMIC_EPLB = None
 
 
-def edge_cloud_broadcast_recv() -> tuple[
+def edge_cloud_send_tensor_dict(
+    tensor_dict: dict[str, torch.Tensor | Any],
+    channel: HiddenChannelType,
+) -> list[Handle]:
+    """Send edge-cloud hidden tensors on the selected Phase6 channel."""
+    pp_group = get_pp_group()
+    if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
+        return pp_group.isend_tensor_dict_on_hidden_channel(
+            tensor_dict, channel=channel
+        )
+    # Compatibility fallback before Phase6 hidden-channel groups are created.
+    if channel == HiddenChannelType.PREFILL_1:
+        return pp_group.isend_tensor_dict(tensor_dict)
+    if channel == HiddenChannelType.DECODE:
+        return pp_group.isend_tensor_dict(tensor_dict, use_alt_group=True)
+    raise RuntimeError(
+        "PREFILL_2 hidden channel requires create_hidden_channel_groups()"
+    )
+
+
+def edge_cloud_broadcast_recv(
+    channel: HiddenChannelType = HiddenChannelType.PREFILL_1,
+) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
+    """Receive PP tensors on the selected Phase6 channel and broadcast them
+    within the local edge/cloud TP group.
+    """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        if hasattr(pp_group, "irecv_tensor_dict_on_hidden_channel"):
+            tensor_dict, comm_handles, comm_postprocess = (
+                pp_group.irecv_tensor_dict_on_hidden_channel(channel=channel)
+            )
+        elif channel == HiddenChannelType.PREFILL_1:
+            tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        elif channel == HiddenChannelType.DECODE:
+            tensor_dict, comm_handles, comm_postprocess = (
+                pp_group.irecv_tensor_dict(use_alt_group=True)
+            )
+        else:
+            raise RuntimeError(
+                "PREFILL_2 hidden channel requires create_hidden_channel_groups()"
+            )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "
             "sender may have failed."
