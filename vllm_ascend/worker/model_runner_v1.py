@@ -2359,10 +2359,6 @@ class NPUModelRunner(GPUModelRunner):
                     # Edge-cloud head segment always returns IntermediateTensors,
                     # regardless of is_last_rank, so the worker can send them to
                     # the cloud side and receive results back for the tail segment.
-                    # For embedding_only edge, the output tensors have actual
-                    # batch size (no cudagraph padding on edge), but cloud's
-                    # pre-allocated buffer is sized to max_num_tokens. Pad here
-                    # so that cloud's sync_and_slice copy_ succeeds.
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
