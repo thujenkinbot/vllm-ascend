@@ -3874,6 +3874,22 @@ class NPUModelRunner(GPUModelRunner):
                 # 断言：边设备输出必须是 IntermediateTensors 类型
                 assert isinstance(outputs, IntermediateTensors)
 
+                # 第二次 sync，与 execute_model 的 tail 段入口 sync 对齐
+                # 使 dummy_run 与 execute_model 的 sync 次数严格 1:1
+                # 返回值与首次 sync 相同（输入参数一致），直接扔掉
+                self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens,
+                    max_num_scheduled_tokens=max_query_len,
+                    use_cascade_attn=False,
+                    allow_microbatching=allow_microbatching,
+                    force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp,
+                    force_uniform_decode=uniform_decode,
+                    force_has_lora=num_active_loras > 0,
+                    force_num_active_loras=num_active_loras,
+                )
+
                 # 重新准备 intermediate_tensors（与上文逻辑相同）
                 intermediate_tokens = num_tokens_padded
                 if enable_sp():
