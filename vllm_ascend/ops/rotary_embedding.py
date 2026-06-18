@@ -131,9 +131,14 @@ def update_cos_sin(positions):
     global _sin
     global _cos_slice
     global _sin_slice
+    global _cos_sin_cache
 
     if _cos_sin_cache is None or _cos is None or _sin is None:
         return
+
+    # Ensure _cos_sin_cache is on the same device as positions
+    if _cos_sin_cache.device != positions.device:
+        _cos_sin_cache = _cos_sin_cache.to(positions.device)
 
     num_tokens = positions.size(0)
     _cos[:, :num_tokens] = (
