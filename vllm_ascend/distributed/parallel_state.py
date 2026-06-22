@@ -393,13 +393,7 @@ def edge_cloud_broadcast_recv() -> tuple[
     is_pp_npu0 = pp_group.world_size == 2
 
     if is_pp_npu0:
-        # restore_residual=False: defer the zero-residual restore to AFTER the
-        # TP broadcast below. Restoring before it would change the broadcasted
-        # tensor count and desync the non-rank-0 peers (which only expect the
-        # tensors advertised in broadcast_object above).
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(
-            restore_residual=False
-        )
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "
             "sender may have failed."
@@ -424,13 +418,6 @@ def edge_cloud_broadcast_recv() -> tuple[
                 handle.wait()
 
         comm_postprocess.append(broadcast_postprocess)
-
-        # Restore the folded residual AFTER the broadcast so this rank ends up
-        # with {hidden_states, residual}, matching what the model expects.
-        def restore_residual_postprocess():
-            GroupCoordinator._restore_residual_after_recv(tensor_dict)
-
-        comm_postprocess.append(restore_residual_postprocess)
         return tensor_dict, comm_handles, comm_postprocess
 
     metadata_list = tp_group.broadcast_object(None, src=0)
@@ -459,9 +446,4 @@ def edge_cloud_broadcast_recv() -> tuple[
         for handle in handles:
             handle.wait()
 
-    # Restore the folded residual AFTER the broadcast so non-rank-0 peers also
-    # end up with {hidden_states, residual}, matching rank 0.
-    def restore_residual_postprocess():
-        GroupCoordinator._restore_residual_after_recv(recv_tensor_dict)
-
-    return recv_tensor_dict, [], [broadcast_postprocess, restore_residual_postprocess]
+    return recv_tensor_dict, [], [broadcast_postprocess]
