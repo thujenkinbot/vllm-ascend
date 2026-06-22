@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
+from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, enable_sp, flashcomm2_enable
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
@@ -584,6 +584,25 @@ def edge_cloud_isend_tensor_dict(
     return handles
 
 
+def _pad_num_tokens_to_tp_multiple(num_tokens: int) -> int:
+    """Round num_tokens up to the local TP size when SP is enabled.
+
+    Sequence-parallel ops require the sequence length to be divisible by the
+    tensor-parallel world size.  When padding is required we still only receive
+    the actual ``num_tokens`` rows over the wire (the sender slices them);
+    the extra rows in the receive buffer are zero-filled padding.
+    """
+    if not enable_sp() or num_tokens <= 0:
+        return num_tokens
+    tp_size = get_tp_group().world_size
+    if tp_size <= 1:
+        return num_tokens
+    remainder = num_tokens % tp_size
+    if remainder == 0:
+        return num_tokens
+    return num_tokens + (tp_size - remainder)
+
+
 def edge_cloud_irecv_tensor_dict(
     num_tokens: int,
     src: int | None = None,
@@ -595,6 +614,12 @@ def edge_cloud_irecv_tensor_dict(
     for each. This eliminates the inter-node pickle+Gloo metadata
     exchange that the standard GroupCoordinator.irecv_tensor_dict
     performs.
+
+    When SP is enabled, the receive buffer is padded up to the nearest
+    multiple of the local TP size.  The sender still transmits only the
+    actual ``num_tokens`` rows, so we issue ``irecv`` into a view of the
+    first ``num_tokens`` rows of the larger buffer.  This keeps the wire
+    payload minimal while satisfying SP's divisibility requirement.
 
     Args:
         num_tokens: total_num_scheduled_tokens from SchedulerOutput
@@ -614,20 +639,24 @@ def edge_cloud_irecv_tensor_dict(
     handles: list[Handle] = []
     postprocess: list[Callable[[], None]] = []
 
+    recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
+
     for key, value in ec_meta.metadata_list:
         if isinstance(value, TensorMetadata):
-            # Replace the placeholder dim-0 with actual num_tokens
-            actual_size = (num_tokens,) + value.size[1:]
+            # Replace the placeholder dim-0 with the TP-padded size; the
+            # actual wire transfer still only covers num_tokens rows.
+            full_size = (recv_num_tokens,) + value.size[1:]
             full_tensor = torch.empty(
-                actual_size, dtype=value.dtype, device=value.device
+                full_size, dtype=value.dtype, device=value.device
             )
 
             if full_tensor.numel() == 0:
                 tensor_dict[key] = full_tensor
                 continue
 
+            recv_view = full_tensor[:num_tokens]
             handle = torch.distributed.irecv(
-                full_tensor, src=pp_group.ranks[src], group=group
+                recv_view, src=pp_group.ranks[src], group=group
             )
             handles.append(handle)
             tensor_dict[key] = full_tensor
@@ -696,7 +725,7 @@ def edge_cloud_broadcast_recv(
     #recv_num_tokens = broadcast_data[0]
     #metadata_list = broadcast_data[1]
     metadata_list = ec_meta.metadata_list
-    recv_num_tokens = num_tokens
+    recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
     if metadata_list is None:
         metadata_list = []
 
@@ -704,9 +733,10 @@ def edge_cloud_broadcast_recv(
 
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
-            # Replace placeholder dim-0 with actual num_tokens
-            actual_size = (recv_num_tokens,) + value.size[1:]
-            tensor = torch.empty(actual_size, dtype=value.dtype, device=value.device)
+            # Replace placeholder dim-0 with the TP-padded size so the
+            # intra-node broadcast matches the tensor allocated by PP NPU0.
+            full_size = (recv_num_tokens,) + value.size[1:]
+            tensor = torch.empty(full_size, dtype=value.dtype, device=value.device)
             recv_tensor_dict[key] = tensor
         else:
             recv_tensor_dict[key] = value
