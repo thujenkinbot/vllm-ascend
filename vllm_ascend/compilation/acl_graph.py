@@ -398,7 +398,8 @@ def graph_params_scope(
 def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
     if _graph_params is not None:
-        raise ValueError("Graph parameters have already been set!")
+        logger.info("Graph parameters have already been set!")
+        return
     _graph_params = make_graph_params(aclgraph_capture_sizes)
 
 
