@@ -446,7 +446,17 @@ class NPUWorker(WorkerBase):
                 # _determine_batch_execution_and_padding, and
                 # _build_attention_metadata with edge's segment_a forward.
                 self.model_runner.cloud_prepare_early(scheduler_output)
-                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                # In the shared-model edge-cloud topology the edge
+                # has a single distributed rank at in-group rank 0;
+                # the cloud first-worker of each dp_rank must
+                # receive the head-layer intermediate tensors from
+                # that single edge rank. Pass the explicit
+                # ``src=0`` so the receive is routed to the edge
+                # rather than the implicit "previous PP rank"
+                # (which would not point at the edge for cloud
+                # first-workers past the first one).
+                tensor_dict, comm_handles, comm_postprocess = (
+                    edge_cloud_broadcast_recv(src=0))
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -497,8 +507,18 @@ class NPUWorker(WorkerBase):
             return output
 
         if is_cloud_device():
-            if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            # In the shared-model edge-cloud topology the cloud
+            # first-worker of each dp_rank is in the shared PP group
+            # with the edge and must send its middle-layer output
+            # back to the edge (in-group rank 0). Other cloud
+            # workers (TP non-first) are in singleton PP groups
+            # and don't communicate with the edge. We use an
+            # explicit ``dst=0`` rather than the default "next PP
+            # rank" routing because the edge sits at in-group rank
+            # 0, not the slot after the cloud.
+            if get_pp_group().world_size > 1:
+                self._pp_send_work = get_pp_group().isend_tensor_dict(
+                    output.tensors, dst=0)
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
@@ -797,8 +817,29 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
+        # NOTE: `self.local_rank` is also consumed by `bind_cpus` for CPU
+        # binding, so it must stay as the original TP local rank. Compute the
+        # adjusted local rank locally and pass it to `init_distributed_environment`.
+        local_rank = self.local_rank
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.data_parallel_size > 1
+        ):
+            # Use local DP rank if available, otherwise use global DP rank.
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+
+            # In edge-cloud mode, local_world_size = edge_npu_count or cloud_npu_count
+            # Use local_world_size as the stride per DP instance
+            local_world_size = parallel_config.local_world_size
+            # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
+            local_rank += dp_local_rank * local_world_size
         init_distributed_environment(
-            self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
+            self.parallel_config.world_size, self.rank, self.distributed_init_method, local_rank, "hccl"
         )
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,

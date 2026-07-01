@@ -20,6 +20,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -143,6 +144,56 @@ class NPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
+
+    def bind_to_shared_model(self, model: nn.Module) -> None:
+        """Bind this runner to a model object loaded by another runner.
+
+        Used by ``SharedModelEdgeWorker`` follower workers to share a single
+        ``nn.Module`` instance across multiple model runners in the same
+        process. Replaces ``self.model`` with ``model`` and mirrors the
+        post-model-creation side effects of the inherited
+        :meth:`GPUModelRunner.load_model`:
+
+        - LoRA: re-wraps the model in the LoRA-aware wrapper.
+        - eagle3: re-sets the aux hidden state layers on the shared model.
+        - speculator: re-runs the speculator ``load_model`` hook.
+        - communication buffer: re-prepares comm buffers for the shared model.
+        - model state: re-initialises the model state machine.
+
+        V2 does not support edge-cloud sharding and does not wrap the model
+        in ``ACLGraphWrapper``; cudagraph capture is handled separately by
+        :class:`ModelAclGraphManager`.
+
+        The caller is responsible for:
+
+        - ensuring ``model`` has already been fully loaded by another
+          runner in the same process (i.e. the leader
+          ``SharedModelEdgeWorker``);
+        - assigning ``self.model_memory_usage`` after binding, because only
+          the leader's profile run actually measures it.
+        """
+        from vllm.v1.worker.gpu.model_runner import (
+            prepare_communication_buffer_for_model, set_eagle3_aux_hidden_state_layers)
+        from vllm.v1.worker.gpu.model_states import init_model_state
+
+        self.model = model
+        if self.lora_config:
+            self.model = self.load_lora_model(self.model, self.vllm_config,
+                                              self.device)
+        if self.use_aux_hidden_state_outputs:
+            assert self.speculative_config is not None
+            set_eagle3_aux_hidden_state_layers(self.model,
+                                               self.speculative_config)
+        if self.speculator is not None:
+            self.speculator.load_model(self.model)
+            self.eplb.maybe_register_speculator(self.speculator,
+                                                self.speculative_config,
+                                                load_dummy_weights=False)
+        prepare_communication_buffer_for_model(self.model)
+        if self.speculator is not None:
+            prepare_communication_buffer_for_model(self.speculator.model)
+        self.model_state = init_model_state(self.vllm_config, self.model,
+                                            self.encoder_cache, self.device)
 
     @torch.inference_mode()
     def profile_run(self) -> None:
