@@ -26,6 +26,7 @@ def _kimi_k25_forward_edge_cloud_segment(
     inputs_embeds: torch.Tensor | None = None,
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
+    self.language_model._vllm_ascend_materialized_pp_boundary = True
     return self.language_model.forward_edge_cloud_segment(
         start_layer,
         end_layer,

@@ -66,6 +66,9 @@ from vllm_ascend.distributed.parallel_state import (
     init_ascend_model_parallel,
     init_edge_cloud_tensor_meta,
 )
+from vllm_ascend.edge_cloud_materialized import (
+    supports_materialized_boundary_for_config,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -116,14 +119,7 @@ def _detect_has_residual(model_config) -> bool:
 
 
 def _use_materialized_residual_boundary(model_config) -> bool:
-    """Use a single-tensor edge-cloud boundary for supported dense models."""
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    model_types = {
-        getattr(hf_text_config, "model_type", ""),
-        getattr(hf_config, "model_type", ""),
-    }
-    return bool(model_types & {"qwen3_5", "qwen3_5_text"})
+    return supports_materialized_boundary_for_config(model_config)
 
 
 class NPUWorker(WorkerBase):

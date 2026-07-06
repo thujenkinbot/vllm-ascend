@@ -132,6 +132,9 @@ from vllm_ascend.compilation.acl_graph_edge_cloud import (
 from vllm_ascend.compilation.edge_cloud_compiler import (
     EdgeCloudCompiledSegment,
 )
+from vllm_ascend.edge_cloud_materialized import (
+    supports_materialized_boundary_for_config,
+)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -709,14 +712,7 @@ class NPUModelRunner(GPUModelRunner):
         return bool(getattr(forward_context, "in_profile_run", False))
 
     def _use_materialized_residual_boundary(self) -> bool:
-        """Qwen3.5-Dense uses a single hidden_states tensor at EC boundaries."""
-        hf_text_config = getattr(self.model_config, "hf_text_config", None)
-        hf_config = getattr(self.model_config, "hf_config", None)
-        model_types = {
-            getattr(hf_text_config, "model_type", ""),
-            getattr(hf_config, "model_type", ""),
-        }
-        return bool(model_types & {"qwen3_5", "qwen3_5_text"})
+        return supports_materialized_boundary_for_config(self.model_config)
 
     def _make_empty_edge_cloud_intermediate_tensors(
         self,

@@ -14,6 +14,11 @@ from vllm.model_executor.models.minimax_m2 import (
     MiniMaxM2Model,
 )
 from vllm.sequence import IntermediateTensors
+from vllm_ascend.edge_cloud_materialized import (
+    apply_final_norm,
+    make_boundary_tensors,
+    restore_boundary_state,
+)
 
 
 def _forward_edge_cloud_segment_minimax_m2(
@@ -49,8 +54,7 @@ def _forward_edge_cloud_segment_minimax_m2(
             "intermediate_tensors is None in edge-cloud segment; "
             "check that all TP ranks receive tensors correctly."
         )
-        hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        hidden_states, residual = restore_boundary_state(self, intermediate_tensors)
 
     # MiniMaxM2DecoderLayer.forward does not accept **kwargs; do not forward
     # extra_layer_kwargs here or unrelated model_kwargs will raise TypeError.
@@ -58,14 +62,9 @@ def _forward_edge_cloud_segment_minimax_m2(
         hidden_states, residual = layer(positions, hidden_states, residual)
 
     if not is_last_segment:
-        if residual is None:
-            residual = torch.zeros_like(hidden_states)
-        return IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
+        return make_boundary_tensors(self, hidden_states, residual)
 
-    hidden_states, _ = self.norm(hidden_states, residual)
-    return hidden_states
+    return apply_final_norm(self.norm, hidden_states, residual)
 
 
 def _minimax_m2_lm_forward_edge_cloud_segment(
