@@ -24,6 +24,11 @@ from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
 from vllm.sequence import IntermediateTensors
 
 
+def _use_materialized_pp_boundary_qwen3_5(self: Qwen3_5Model) -> bool:
+    """Qwen3.5-Dense can send the complete residual stream at EC boundaries."""
+    return getattr(self.config, "model_type", None) in ("qwen3_5", "qwen3_5_text")
+
+
 def _forward_edge_cloud_segment_qwen3_5(
     self: Qwen3_5Model,
     start_layer: int,
@@ -58,7 +63,10 @@ def _forward_edge_cloud_segment_qwen3_5(
             "check that all TP ranks receive tensors correctly."
         )
         hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        if _use_materialized_pp_boundary_qwen3_5(self):
+            residual = None
+        else:
+            residual = intermediate_tensors["residual"]
 
     for layer in islice(self.layers, start_layer, end_layer):
         hidden_states, residual = layer(
@@ -69,6 +77,10 @@ def _forward_edge_cloud_segment_qwen3_5(
         )
 
     if not is_last_segment:
+        if _use_materialized_pp_boundary_qwen3_5(self):
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            return IntermediateTensors({"hidden_states": hidden_states})
         if residual is None:
             residual = torch.zeros_like(hidden_states)
         return IntermediateTensors(

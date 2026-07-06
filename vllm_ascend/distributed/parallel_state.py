@@ -194,6 +194,7 @@ def init_edge_cloud_tensor_meta(
     has_residual: bool = True,
     hc_mult: int = 1,
     mode: str = "head_tail",
+    materialize_residual_boundary: bool = False,
 ):
     """Initialize the pre-computed tensor metadata for edge-cloud transfers.
 
@@ -206,9 +207,10 @@ def init_edge_cloud_tensor_meta(
     ``embedding_only`` mode the edge sends only embeddings (no transformer
     layers run, so the residual would be a fabricated zero tensor). To keep
     the model layers unchanged, the receiver still allocates a zero residual
-    buffer locally; only the wire payload omits ``residual``. c2e always
+    buffer locally; only the wire payload omits ``residual``. c2e normally
     carries the real residual that the edge tail segment needs for its final
-    norm. In ``head_tail`` mode both directions carry residual on the wire.
+    norm. In materialized-boundary mode, each segment returns the complete
+    residual stream, so both directions omit ``residual``.
 
     Args:
         hidden_size: model hidden dimension (from hf_text_config.hidden_size)
@@ -224,23 +226,34 @@ def init_edge_cloud_tensor_meta(
             Qwen3.5, Llama, etc.).
         mode: edge-cloud mode ("head_tail" or "embedding_only"). In
             embedding_only the edge→cloud direction omits the redundant zero
-            residual; in head_tail both directions carry residual.
+            residual; in head_tail both directions normally carry residual.
+        materialize_residual_boundary: If true, each segment returns
+            ``hidden_states + residual`` at the edge-cloud boundary and the
+            receiver enters its first local layer with ``residual=None``. This
+            allows both directions to transfer only ``hidden_states``.
     """
     global _EDGE_CLOUD_TENSOR_META_E2C, _EDGE_CLOUD_TENSOR_META_C2E
     global _EDGE_CLOUD_TENSOR_META
 
-    # e2c (edge→cloud): in embedding_only the edge runs no transformer layers,
-    # so its residual would be a fabricated zero tensor carrying no information.
-    # Drop it from the wire payload to halve the cross-node bandwidth, but the
-    # receiver still allocates a zero residual buffer so model layers stay
-    # unchanged. head_tail always runs >=1 head layer, so the residual is real
-    # and must be transmitted.
-    e2c_recv_has_residual = has_residual
-    e2c_send_has_residual = has_residual and (mode != "embedding_only")
-    # c2e (cloud→edge): the cloud produces a real residual that the edge tail
-    # segment's final norm consumes, so it is always transmitted and received.
-    c2e_recv_has_residual = has_residual
-    c2e_send_has_residual = has_residual
+    if materialize_residual_boundary:
+        e2c_recv_has_residual = False
+        e2c_send_has_residual = False
+        c2e_recv_has_residual = False
+        c2e_send_has_residual = False
+    else:
+        # e2c (edge→cloud): in embedding_only the edge runs no transformer
+        # layers, so its residual would be a fabricated zero tensor carrying no
+        # information. Drop it from the wire payload to halve the cross-node
+        # bandwidth, but the receiver still allocates a zero residual buffer so
+        # model layers stay unchanged. head_tail always runs >=1 head layer, so
+        # the residual is real and must be transmitted.
+        e2c_recv_has_residual = has_residual
+        e2c_send_has_residual = has_residual and (mode != "embedding_only")
+        # c2e (cloud→edge): the cloud produces a real residual that the edge
+        # tail segment's final norm consumes, so it is always transmitted and
+        # received.
+        c2e_recv_has_residual = has_residual
+        c2e_send_has_residual = has_residual
 
     _EDGE_CLOUD_TENSOR_META_E2C = _build_edge_cloud_tensor_meta(
         hidden_size, hidden_dtype, e2c_recv_has_residual, e2c_send_has_residual, hc_mult,
@@ -255,7 +268,7 @@ def init_edge_cloud_tensor_meta(
         "[EdgeCloud] Initialized tensor meta (mode=%s): "
         "e2c recv_keys=%s send_keys=%s (merge=%s), "
         "c2e recv_keys=%s send_keys=%s (merge=%s), dtype=%s, "
-        "hidden_size=%d, hc_mult=%d",
+        "hidden_size=%d, hc_mult=%d, materialize_residual_boundary=%s",
         mode,
         _EDGE_CLOUD_TENSOR_META_E2C.tensor_keys,
         _EDGE_CLOUD_TENSOR_META_E2C.send_tensor_keys,
@@ -266,6 +279,7 @@ def init_edge_cloud_tensor_meta(
         hidden_dtype,
         hidden_size,
         hc_mult,
+        materialize_residual_boundary,
     )
 
 

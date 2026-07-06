@@ -14,6 +14,7 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import TensorMetadata
 
+import vllm_ascend.envs as envs_ascend
 # Tests run on CPU; force the merged buffer allocator to use cpu instead of npu.
 # We patch _allocate_merged_recv_buffer below per-test, but the simpler shape
 # checks just inspect EdgeCloudTensorMeta fields, so most tests do not need NPU.
@@ -44,9 +45,7 @@ def _reset_meta():
 def test_init_meta_merge_enabled_2d():
     """Standard 2D case: hidden_states + residual cat along dim=-1."""
     with patch.object(
-        ps.envs_ascend := __import__(
-            "vllm_ascend.envs", fromlist=["VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD"]
-        ),
+        envs_ascend,
         "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD",
         True,
     ):
@@ -235,9 +234,7 @@ def test_init_meta_direction_aware_embedding_only():
 def test_init_meta_direction_aware_head_tail():
     """head_tail: both directions carry residual (identical)."""
     with patch.object(
-        ps.envs_ascend := __import__(
-            "vllm_ascend.envs", fromlist=["VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD"]
-        ),
+        envs_ascend,
         "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD",
         True,
     ):
@@ -256,3 +253,28 @@ def test_init_meta_direction_aware_head_tail():
     assert c2e.send_tensor_keys == ["hidden_states", "residual"]
     assert e2c.merge_payload is True
     assert c2e.merge_payload is True
+
+
+def test_init_meta_materialized_boundary_omits_residual():
+    """materialized boundary: both directions transfer hidden_states only."""
+    with patch.object(
+        envs_ascend,
+        "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD",
+        True,
+    ):
+        ps.init_edge_cloud_tensor_meta(
+            hidden_size=128,
+            hidden_dtype=torch.bfloat16,
+            has_residual=True,
+            hc_mult=1,
+            mode="head_tail",
+            materialize_residual_boundary=True,
+        )
+    e2c = ps.get_edge_cloud_tensor_meta("e2c")
+    c2e = ps.get_edge_cloud_tensor_meta("c2e")
+    assert e2c.tensor_keys == ["hidden_states"]
+    assert e2c.send_tensor_keys == ["hidden_states"]
+    assert c2e.tensor_keys == ["hidden_states"]
+    assert c2e.send_tensor_keys == ["hidden_states"]
+    assert e2c.merge_payload is False
+    assert c2e.merge_payload is False

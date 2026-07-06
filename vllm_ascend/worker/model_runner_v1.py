@@ -708,6 +708,36 @@ class NPUModelRunner(GPUModelRunner):
             return False
         return bool(getattr(forward_context, "in_profile_run", False))
 
+    def _use_materialized_residual_boundary(self) -> bool:
+        """Qwen3.5-Dense uses a single hidden_states tensor at EC boundaries."""
+        hf_text_config = getattr(self.model_config, "hf_text_config", None)
+        hf_config = getattr(self.model_config, "hf_config", None)
+        model_types = {
+            getattr(hf_text_config, "model_type", ""),
+            getattr(hf_config, "model_type", ""),
+        }
+        return bool(model_types & {"qwen3_5", "qwen3_5_text"})
+
+    def _make_empty_edge_cloud_intermediate_tensors(
+        self,
+        batch_size: int,
+    ) -> IntermediateTensors:
+        if self._use_materialized_residual_boundary():
+            hidden_size = self.model_config.hf_text_config.hidden_size
+            return IntermediateTensors({
+                "hidden_states": torch.zeros(
+                    (batch_size, hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            })
+        assert self.model is not None
+        return self.model.make_empty_intermediate_tensors(
+            batch_size=batch_size,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
     def _create_segment_callable(
         self,
         model: torch.nn.Module,
@@ -4119,9 +4149,10 @@ class NPUModelRunner(GPUModelRunner):
                         if enable_sp() and (self.edge_cloud_cfg.mode != "embedding_only"
                             or not self.supports_mm_inputs):
                             max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
-                        # 调用模型方法创建空的中间张量
-                        self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                            batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+                        self.intermediate_tensors = (
+                            self._make_empty_edge_cloud_intermediate_tensors(
+                                batch_size=max_actual_tokens,
+                            )
                         )
                         logger.info(
                             "[Cloud _dummy_run] Created intermediate_tensors "
@@ -4146,8 +4177,10 @@ class NPUModelRunner(GPUModelRunner):
                     max_actual_tokens = self.max_num_tokens
                     if enable_sp():
                         max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
-                    self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                        batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+                    self.intermediate_tensors = (
+                        self._make_empty_edge_cloud_intermediate_tensors(
+                            batch_size=max_actual_tokens,
+                        )
                     )
                 intermediate_tensors = IntermediateTensors(
                     {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
