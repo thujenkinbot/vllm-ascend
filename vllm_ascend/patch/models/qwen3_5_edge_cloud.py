@@ -29,6 +29,17 @@ def _use_materialized_pp_boundary_qwen3_5(self: Qwen3_5Model) -> bool:
     return getattr(self.config, "model_type", None) in ("qwen3_5", "qwen3_5_text")
 
 
+def _apply_final_norm_qwen3_5(
+    self: Qwen3_5Model,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> torch.Tensor:
+    if residual is None:
+        return self.norm(hidden_states)
+    hidden_states, _ = self.norm(hidden_states, residual)
+    return hidden_states
+
+
 def _forward_edge_cloud_segment_qwen3_5(
     self: Qwen3_5Model,
     start_layer: int,
@@ -87,8 +98,7 @@ def _forward_edge_cloud_segment_qwen3_5(
             {"hidden_states": hidden_states, "residual": residual}
         )
 
-    hidden_states, _ = self.norm(hidden_states, residual)
-    return hidden_states
+    return _apply_final_norm_qwen3_5(self, hidden_states, residual)
 
 
 def _qwen3_5_lm_forward_edge_cloud_segment(
