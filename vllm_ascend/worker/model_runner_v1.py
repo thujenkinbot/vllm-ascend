@@ -133,7 +133,7 @@ from vllm_ascend.compilation.edge_cloud_compiler import (
     EdgeCloudCompiledSegment,
 )
 from vllm_ascend.edge_cloud_materialized import (
-    supports_materialized_boundary_for_config,
+    supports_single_hidden_boundary_for_config,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
@@ -711,18 +711,23 @@ class NPUModelRunner(GPUModelRunner):
             return False
         return bool(getattr(forward_context, "in_profile_run", False))
 
-    def _use_materialized_residual_boundary(self) -> bool:
-        return supports_materialized_boundary_for_config(self.model_config)
+    def _use_single_hidden_boundary(self) -> bool:
+        return supports_single_hidden_boundary_for_config(self.model_config)
 
     def _make_empty_edge_cloud_intermediate_tensors(
         self,
         batch_size: int,
     ) -> IntermediateTensors:
-        if self._use_materialized_residual_boundary():
+        if self._edge_cloud_enabled and self._use_single_hidden_boundary():
             hidden_size = self.model_config.hf_text_config.hidden_size
+            hc_mult = getattr(self.model_config.hf_text_config, "hc_mult", 1)
+            if hc_mult > 1:
+                hidden_shape = (batch_size, hc_mult, hidden_size)
+            else:
+                hidden_shape = (batch_size, hidden_size)
             return IntermediateTensors({
                 "hidden_states": torch.zeros(
-                    (batch_size, hidden_size),
+                    hidden_shape,
                     dtype=self.dtype,
                     device=self.device,
                 )
@@ -4258,8 +4263,10 @@ class NPUModelRunner(GPUModelRunner):
                     if enable_sp():
                         max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
                         # 调用模型方法创建空的中间张量
-                    self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                        batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+                    self.intermediate_tensors = (
+                        self._make_empty_edge_cloud_intermediate_tensors(
+                            batch_size=max_actual_tokens,
+                        )
                     )
                 # 切片
                 intermediate_tensors = IntermediateTensors(

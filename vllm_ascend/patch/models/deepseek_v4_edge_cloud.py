@@ -30,12 +30,13 @@ Scheme: "head-3 / tail-1"
 Key differences from standard Llama-style models:
   - DecoderLayer signature: ``layer(positions, hidden_states, residual,
     llama_4_scaling)`` returns ``(hidden_states, residual)``.
-  - Residual is managed internally via ``hc_pre`` / ``hc_post`` and must be
-    passed across segments through ``IntermediateTensors``.
+  - Residual is managed internally via ``hc_pre`` / ``hc_post``. The layer
+    overwrites the incoming residual from ``hidden_states``, so segment
+    boundaries only need to transfer ``hidden_states``.
   - Embedding needs ``unsqueeze(-2).repeat(1, hc_mult, 1)``.
   - Tail segment needs ``hc_head()`` + ``norm()``.
-  - Only ``hidden_states`` and ``residual`` are transmitted across the
-    edge-cloud network; ``input_ids`` is kept locally on the edge side.
+  - Only ``hidden_states`` is transmitted across the edge-cloud network;
+    ``input_ids`` is kept locally on the edge side.
 """
 
 from itertools import islice
@@ -69,8 +70,8 @@ def _forward_edge_cloud_segment_v4(
         end_layer: Last layer index to execute (exclusive).
         input_ids: Token IDs for embedding (first segment only).
         positions: Position IDs.
-        intermediate_tensors: Carries ``hidden_states`` and ``residual`` from
-            the previous segment.
+        intermediate_tensors: Carries ``hidden_states`` from the previous
+            segment.
         inputs_embeds: Optional pre-computed embeddings.
 
     Returns:
@@ -103,7 +104,7 @@ def _forward_edge_cloud_segment_v4(
             "intermediate_tensors required for non-first segment in V4"
         )
         hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        residual = None
 
     # ----- Execute layers in [start_layer, end_layer) -----
     # llama_4_scaling is currently None because scaling config is not enabled.
@@ -121,14 +122,13 @@ def _forward_edge_cloud_segment_v4(
     # In the "head-3 / tail-1" edge-cloud scheme, all Hash MoE layers reside
     # on the edge side (segment A).  The cloud side (segment C) and the edge
     # tail (segment E) do not need ``input_ids``.  We only pass
-    # ``hidden_states`` and ``residual`` across the network.
+    # ``hidden_states`` across the network.  DeepSeek-V4's HC layers recreate
+    # their local residual from hidden_states at layer entry, and hc_head/norm
+    # do not consume residual.
 
     if not is_last_segment:
-        # residual keeps its original (n, hc_mult, h) shape, aligned with
-        # standard forward path and make_empty_intermediate_tensors buffer.
         return IntermediateTensors({
             "hidden_states": hidden_states,
-            "residual": residual,
         })
 
     # Last segment: hc_head + norm

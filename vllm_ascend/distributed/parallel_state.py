@@ -227,10 +227,10 @@ def init_edge_cloud_tensor_meta(
         mode: edge-cloud mode ("head_tail" or "embedding_only"). In
             embedding_only the edge→cloud direction omits the redundant zero
             residual; in head_tail both directions normally carry residual.
-        materialize_residual_boundary: If true, each segment returns
-            ``hidden_states + residual`` at the edge-cloud boundary and the
-            receiver enters its first local layer with ``residual=None``. This
-            allows both directions to transfer only ``hidden_states``.
+        materialize_residual_boundary: If true, both directions transfer only
+            ``hidden_states``. Standard residual models materialize
+            ``hidden_states + residual`` before sending; DeepSeek-V4 sends its
+            self-contained HC ``hidden_states`` unchanged.
     """
     global _EDGE_CLOUD_TENSOR_META_E2C, _EDGE_CLOUD_TENSOR_META_C2E
     global _EDGE_CLOUD_TENSOR_META
@@ -268,7 +268,7 @@ def init_edge_cloud_tensor_meta(
         "[EdgeCloud] Initialized tensor meta (mode=%s): "
         "e2c recv_keys=%s send_keys=%s (merge=%s), "
         "c2e recv_keys=%s send_keys=%s (merge=%s), dtype=%s, "
-        "hidden_size=%d, hc_mult=%d, materialize_residual_boundary=%s",
+        "hidden_size=%d, hc_mult=%d, single_hidden_boundary=%s",
         mode,
         _EDGE_CLOUD_TENSOR_META_E2C.tensor_keys,
         _EDGE_CLOUD_TENSOR_META_E2C.send_tensor_keys,

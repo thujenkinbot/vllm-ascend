@@ -67,7 +67,7 @@ from vllm_ascend.distributed.parallel_state import (
     init_edge_cloud_tensor_meta,
 )
 from vllm_ascend.edge_cloud_materialized import (
-    supports_materialized_boundary_for_config,
+    supports_single_hidden_boundary_for_config,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -118,8 +118,8 @@ def _detect_has_residual(model_config) -> bool:
     return True
 
 
-def _use_materialized_residual_boundary(model_config) -> bool:
-    return supports_materialized_boundary_for_config(model_config)
+def _use_single_hidden_boundary(model_config) -> bool:
+    return supports_single_hidden_boundary_for_config(model_config)
 
 
 class NPUWorker(WorkerBase):
@@ -391,7 +391,7 @@ class NPUWorker(WorkerBase):
                 hc_mult=hc_mult,
                 mode=self.model_runner.edge_cloud_cfg.mode,
                 materialize_residual_boundary=(
-                    _use_materialized_residual_boundary(self.model_config)
+                    _use_single_hidden_boundary(self.model_config)
                 ),
             )
 
