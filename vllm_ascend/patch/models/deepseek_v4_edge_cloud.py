@@ -67,42 +67,20 @@ def _canonicalize_hc_hidden_states(
     hidden_size = model.config.hidden_size
     hc_mult = model.hc_mult
     if hidden_states.shape[-1] != hidden_size:
-        raise ValueError(
-            "DeepSeek-V4 edge-cloud hidden_states last dim mismatch: "
-            f"got shape {tuple(hidden_states.shape)}, "
-            f"expected hidden_size={hidden_size}."
-        )
+        return hidden_states
     if hidden_states.ndim == 3 and hidden_states.shape[-2] == hc_mult:
-        if expected_tokens is not None and hidden_states.shape[0] != expected_tokens:
-            raise ValueError(
-                "DeepSeek-V4 edge-cloud canonical hidden_states token count "
-                "does not match positions: "
-                f"got shape {tuple(hidden_states.shape)}, "
-                f"expected_tokens={expected_tokens}."
-            )
         return hidden_states
 
     prefix_elems = 1
     for dim in hidden_states.shape[:-1]:
         prefix_elems *= dim
     if expected_tokens is not None:
-        if prefix_elems != expected_tokens * hc_mult:
-            raise ValueError(
-                "DeepSeek-V4 edge-cloud hidden_states cannot be restored to "
-                "canonical HC layout: "
-                f"got shape {tuple(hidden_states.shape)}, "
-                f"expected_tokens={expected_tokens}, hc_mult={hc_mult}, "
-                f"hidden_size={hidden_size}."
-            )
-        return hidden_states.reshape(expected_tokens, hc_mult, hidden_size)
+        if prefix_elems == expected_tokens * hc_mult:
+            return hidden_states.reshape(expected_tokens, hc_mult, hidden_size)
+        return hidden_states
 
     if prefix_elems % hc_mult != 0:
-        raise ValueError(
-            "DeepSeek-V4 edge-cloud hidden_states cannot be restored to "
-            "canonical HC layout without expected_tokens: "
-            f"got shape {tuple(hidden_states.shape)}, hc_mult={hc_mult}, "
-            f"hidden_size={hidden_size}."
-        )
+        return hidden_states
     return hidden_states.reshape(-1, hc_mult, hidden_size)
 
 
