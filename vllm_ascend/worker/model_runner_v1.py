@@ -134,6 +134,7 @@ from vllm_ascend.compilation.edge_cloud_compiler import (
 )
 from vllm_ascend.edge_cloud_materialized import (
     edge_cloud_hc_mult_from_config,
+    supports_hidden_only_boundary_for_config,
     supports_single_hidden_boundary_for_config,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -714,6 +715,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def _use_single_hidden_boundary(self) -> bool:
         return supports_single_hidden_boundary_for_config(self.model_config)
+
+    def _use_dynamic_edge_cloud_intermediate_shape(self) -> bool:
+        return (
+            self._edge_cloud_enabled
+            and supports_hidden_only_boundary_for_config(self.model_config)
+        )
 
     def _make_empty_edge_cloud_intermediate_tensors(
         self,
@@ -3398,6 +3405,29 @@ class NPUModelRunner(GPUModelRunner):
         assert self.intermediate_tensors is not None
         tp = self.vllm_config.parallel_config.tensor_parallel_size
 
+        def _ensure_intermediate_buffer(
+            key: str,
+            value: torch.Tensor,
+            rows: int,
+        ) -> None:
+            if (
+                not self._use_dynamic_edge_cloud_intermediate_shape()
+                or not isinstance(value, torch.Tensor)
+            ):
+                return
+            current = self.intermediate_tensors.tensors.get(key)
+            if (
+                current is None
+                or current.shape[0] < rows
+                or current.shape[1:] != value.shape[1:]
+            ):
+                alloc_rows = max(rows, value.shape[0])
+                self.intermediate_tensors[key] = torch.zeros(
+                    (alloc_rows,) + tuple(value.shape[1:]),
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+
         if sync_self:
             assert intermediate_tensors is not None, (
                 "sync_and_slice_intermediate_tensors received None; "
@@ -3415,6 +3445,7 @@ class NPUModelRunner(GPUModelRunner):
                 # buffer so residual is always present.
                 for k, v in intermediate_tensors.items():
                     copy_len = num_tokens
+                    _ensure_intermediate_buffer(k, v, copy_len)
                     self.intermediate_tensors[k][:copy_len].copy_(
                         v[:copy_len], non_blocking=True
                     )
@@ -3438,6 +3469,7 @@ class NPUModelRunner(GPUModelRunner):
                     src_len = v.shape[0]
                     if copy_len > src_len:
                         copy_len = src_len
+                    _ensure_intermediate_buffer(k, v, copy_len)
                     dst = self.intermediate_tensors[k][:copy_len]
                     # Senders may transmit only real tokens; fill graph padding locally.
                     recv_len = min(v.shape[0], copy_len)
