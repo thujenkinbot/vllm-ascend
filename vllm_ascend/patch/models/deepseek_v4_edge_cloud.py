@@ -53,6 +53,31 @@ from vllm_ascend.models.deepseek_v4 import (
 )
 
 
+def _flatten_token_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
+    if hidden_states.ndim > 2:
+        return hidden_states.reshape(-1, hidden_states.shape[-1])
+    return hidden_states
+
+
+def _canonicalize_hc_hidden_states(
+    model: DeepseekV4Model,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    hidden_size = model.config.hidden_size
+    hc_mult = model.hc_mult
+    if hidden_states.shape[-1] != hidden_size:
+        return hidden_states
+    if hidden_states.ndim == 3 and hidden_states.shape[-2] == hc_mult:
+        return hidden_states
+
+    prefix_elems = 1
+    for dim in hidden_states.shape[:-1]:
+        prefix_elems *= dim
+    if prefix_elems % hc_mult != 0:
+        return hidden_states
+    return hidden_states.reshape(-1, hc_mult, hidden_size)
+
+
 def _forward_edge_cloud_segment_v4(
     self: DeepseekV4Model,
     start_layer: int,
@@ -97,13 +122,16 @@ def _forward_edge_cloud_segment_v4(
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_input_ids(input_ids)
+        hidden_states = _flatten_token_hidden(hidden_states)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         residual = None
     else:
         assert intermediate_tensors is not None, (
             "intermediate_tensors required for non-first segment in V4"
         )
-        hidden_states = intermediate_tensors["hidden_states"]
+        hidden_states = _canonicalize_hc_hidden_states(
+            self, intermediate_tensors["hidden_states"]
+        )
         residual = None
 
     # ----- Execute layers in [start_layer, end_layer) -----
@@ -127,6 +155,7 @@ def _forward_edge_cloud_segment_v4(
     # do not consume residual.
 
     if not is_last_segment:
+        hidden_states = _canonicalize_hc_hidden_states(self, hidden_states)
         return IntermediateTensors({
             "hidden_states": hidden_states,
         })
