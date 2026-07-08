@@ -61,16 +61,13 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
     edge_cloud_broadcast_recv,
-    edge_cloud_broadcast_recv_with_metadata,
     edge_cloud_isend_tensor_dict,
-    edge_cloud_isend_tensor_dict_with_metadata,
     get_edge_cloud_tensor_meta,
     init_ascend_model_parallel,
     init_edge_cloud_tensor_meta,
 )
 from vllm_ascend.edge_cloud_materialized import (
     edge_cloud_hc_mult_from_config,
-    supports_hidden_only_boundary_for_config,
     supports_single_hidden_boundary_for_config,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -124,10 +121,6 @@ def _detect_has_residual(model_config) -> bool:
 
 def _use_single_hidden_boundary(model_config) -> bool:
     return supports_single_hidden_boundary_for_config(model_config)
-
-
-def _use_dynamic_edge_cloud_metadata(model_config) -> bool:
-    return supports_hidden_only_boundary_for_config(model_config)
 
 
 class NPUWorker(WorkerBase):
@@ -559,27 +552,16 @@ class NPUWorker(WorkerBase):
                 do_sp_chunk = enable_sp() and (
                     self.model_runner.edge_cloud_cfg.mode != "embedding_only"
                     or not self.model_runner.supports_mm_inputs)
-                dynamic_ec_metadata = _use_dynamic_edge_cloud_metadata(
-                    self.model_config
+                merge_payload = get_edge_cloud_tensor_meta().merge_payload
+                tensor_dict, comm_handles, comm_postprocess = (
+                    edge_cloud_broadcast_recv(
+                        num_tokens=scheduler_output.total_num_scheduled_tokens,
+                        sp_chunk=do_sp_chunk and merge_payload,
+                    )
                 )
-                if dynamic_ec_metadata:
-                    tensor_dict, comm_handles, comm_postprocess = (
-                        edge_cloud_broadcast_recv_with_metadata(
-                            sp_chunk=do_sp_chunk,
-                        )
-                    )
-                    merge_payload = False
-                else:
-                    merge_payload = get_edge_cloud_tensor_meta().merge_payload
-                    tensor_dict, comm_handles, comm_postprocess = (
-                        edge_cloud_broadcast_recv(
-                            num_tokens=scheduler_output.total_num_scheduled_tokens,
-                            sp_chunk=do_sp_chunk and merge_payload,
-                        )
-                    )
                 self.model_runner.cloud_prepare_early(scheduler_output)
 
-                if do_sp_chunk and not merge_payload and not dynamic_ec_metadata:
+                if do_sp_chunk and not merge_payload:
                     tensor_dict = {
                         k: sequence_parallel_chunk(v)
                         for k, v in tensor_dict.items()
@@ -631,36 +613,19 @@ class NPUWorker(WorkerBase):
                 # cudagraph / SP / DP padding, letting the cloud receiver
                 # allocate buffers from SchedulerOutput.total_num_scheduled_tokens
                 # without an inter-node metadata exchange.
-                if _use_dynamic_edge_cloud_metadata(self.model_config):
-                    self._pp_send_work = edge_cloud_isend_tensor_dict_with_metadata(
-                        _gathered,
-                        num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    )
-                else:
-                    self._pp_send_work = edge_cloud_isend_tensor_dict(
-                        _gathered,
-                        num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    )
+                self._pp_send_work = edge_cloud_isend_tensor_dict(
+                    _gathered,
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
             edge_sp = enable_sp()
-            dynamic_ec_metadata = _use_dynamic_edge_cloud_metadata(
-                self.model_config
+            edge_merge = get_edge_cloud_tensor_meta().merge_payload
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv(
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    sp_chunk=edge_sp and edge_merge,
+                )
             )
-            if dynamic_ec_metadata:
-                tensor_dict, comm_handles, comm_postprocess = (
-                    edge_cloud_broadcast_recv_with_metadata(
-                        sp_chunk=edge_sp,
-                    )
-                )
-                edge_merge = False
-            else:
-                edge_merge = get_edge_cloud_tensor_meta().merge_payload
-                tensor_dict, comm_handles, comm_postprocess = (
-                    edge_cloud_broadcast_recv(
-                        num_tokens=scheduler_output.total_num_scheduled_tokens,
-                        sp_chunk=edge_sp and edge_merge,
-                    )
-                )
-            if edge_sp and not edge_merge and not dynamic_ec_metadata:
+            if edge_sp and not edge_merge:
                 tensor_dict = {
                     k: sequence_parallel_chunk(v)
                     for k, v in tensor_dict.items()
@@ -690,16 +655,10 @@ class NPUWorker(WorkerBase):
                 # back to the unpadded length on the sender side so the edge
                 # receiver can keep allocating buffers from scheduler total
                 # alone (no metadata wire transfer needed).
-                if _use_dynamic_edge_cloud_metadata(self.model_config):
-                    self._pp_send_work = edge_cloud_isend_tensor_dict_with_metadata(
-                        _gathered,
-                        num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    )
-                else:
-                    self._pp_send_work = edge_cloud_isend_tensor_dict(
-                        _gathered,
-                        num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    )
+                self._pp_send_work = edge_cloud_isend_tensor_dict(
+                    _gathered,
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise

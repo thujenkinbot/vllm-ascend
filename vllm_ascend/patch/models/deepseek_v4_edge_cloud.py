@@ -62,20 +62,54 @@ def _flatten_token_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
 def _canonicalize_hc_hidden_states(
     model: DeepseekV4Model,
     hidden_states: torch.Tensor,
+    expected_tokens: int | None,
 ) -> torch.Tensor:
     hidden_size = model.config.hidden_size
     hc_mult = model.hc_mult
     if hidden_states.shape[-1] != hidden_size:
-        return hidden_states
+        raise ValueError(
+            "DeepSeek-V4 edge-cloud hidden_states last dim mismatch: "
+            f"got shape {tuple(hidden_states.shape)}, "
+            f"expected hidden_size={hidden_size}."
+        )
     if hidden_states.ndim == 3 and hidden_states.shape[-2] == hc_mult:
+        if expected_tokens is not None and hidden_states.shape[0] != expected_tokens:
+            raise ValueError(
+                "DeepSeek-V4 edge-cloud canonical hidden_states token count "
+                "does not match positions: "
+                f"got shape {tuple(hidden_states.shape)}, "
+                f"expected_tokens={expected_tokens}."
+            )
         return hidden_states
 
     prefix_elems = 1
     for dim in hidden_states.shape[:-1]:
         prefix_elems *= dim
+    if expected_tokens is not None:
+        if prefix_elems != expected_tokens * hc_mult:
+            raise ValueError(
+                "DeepSeek-V4 edge-cloud hidden_states cannot be restored to "
+                "canonical HC layout: "
+                f"got shape {tuple(hidden_states.shape)}, "
+                f"expected_tokens={expected_tokens}, hc_mult={hc_mult}, "
+                f"hidden_size={hidden_size}."
+            )
+        return hidden_states.reshape(expected_tokens, hc_mult, hidden_size)
+
     if prefix_elems % hc_mult != 0:
-        return hidden_states
+        raise ValueError(
+            "DeepSeek-V4 edge-cloud hidden_states cannot be restored to "
+            "canonical HC layout without expected_tokens: "
+            f"got shape {tuple(hidden_states.shape)}, hc_mult={hc_mult}, "
+            f"hidden_size={hidden_size}."
+        )
     return hidden_states.reshape(-1, hc_mult, hidden_size)
+
+
+def _expected_tokens_from_positions(positions: torch.Tensor | None) -> int | None:
+    if positions is None:
+        return None
+    return int(positions.numel())
 
 
 def _forward_edge_cloud_segment_v4(
@@ -111,6 +145,7 @@ def _forward_edge_cloud_segment_v4(
 
     is_first_segment = (start_layer == 0 and get_pp_group().is_first_rank)
     is_last_segment = (end_layer == num_layers and get_pp_group().is_last_rank)
+    expected_tokens = _expected_tokens_from_positions(positions)
 
     # ----- Embedding or restore intermediate state -----
     if is_first_segment:
@@ -130,7 +165,7 @@ def _forward_edge_cloud_segment_v4(
             "intermediate_tensors required for non-first segment in V4"
         )
         hidden_states = _canonicalize_hc_hidden_states(
-            self, intermediate_tensors["hidden_states"]
+            self, intermediate_tensors["hidden_states"], expected_tokens
         )
         residual = None
 
@@ -155,7 +190,9 @@ def _forward_edge_cloud_segment_v4(
     # do not consume residual.
 
     if not is_last_segment:
-        hidden_states = _canonicalize_hc_hidden_states(self, hidden_states)
+        hidden_states = _canonicalize_hc_hidden_states(
+            self, hidden_states, expected_tokens
+        )
         return IntermediateTensors({
             "hidden_states": hidden_states,
         })

@@ -836,39 +836,6 @@ def edge_cloud_isend_tensor_dict(
     return handles
 
 
-def edge_cloud_isend_tensor_dict_with_metadata(
-    tensor_dict: dict[str, torch.Tensor | Any],
-    dst: int | None = None,
-    num_tokens: int | None = None,
-) -> list[Handle]:
-    """Send edge-cloud tensors with metadata sync for dynamic-shape models.
-
-    DeepSeek-V4 Flash can produce hidden states whose non-leading shape is not
-    a static config value, so the pre-computed EdgeCloudTensorMeta fast path
-    cannot safely allocate receive buffers.  This fallback keeps the
-    model-level optimization (the model only returns ``hidden_states``) while
-    using the standard PP tensor-dict metadata exchange for exact shapes.
-    """
-    pp_group = get_pp_group()
-    if pp_group.world_size <= 1:
-        return []
-
-    if num_tokens is None:
-        send_dict = tensor_dict
-    else:
-        send_dict = {}
-        for key, value in tensor_dict.items():
-            if (
-                isinstance(value, torch.Tensor)
-                and value.numel() > 0
-                and value.shape[0] > num_tokens
-            ):
-                value = value[:num_tokens]
-            send_dict[key] = value
-
-    return pp_group.isend_tensor_dict(send_dict, dst=dst, all_gather_group=None)
-
-
 def _allocate_merged_recv_buffer(
     ec_meta: "EdgeCloudTensorMeta",
     num_tokens: int,
@@ -1229,84 +1196,5 @@ def edge_cloud_broadcast_recv(
             )
         for handle in handles:
             handle.wait()
-
-    return recv_tensor_dict, [], [broadcast_postprocess]
-
-
-def edge_cloud_broadcast_recv_with_metadata(
-    sp_chunk: bool = False,
-) -> tuple[
-    dict[str, torch.Tensor | Any] | None,
-    list[Handle],
-    list[Callable[[], None]],
-]:
-    """Receive edge-cloud tensors with sender-provided metadata.
-
-    This is a dynamic-shape fallback for models whose edge-cloud boundary
-    tensors cannot be described by static EdgeCloudTensorMeta. PP rank 0
-    receives exact tensor metadata from the peer, broadcasts that metadata
-    within the local TP group, and then broadcasts the received tensors.
-    """
-    pp_group = get_pp_group()
-    tp_group = get_tp_group()
-    is_pp_npu0 = pp_group.world_size == 2
-
-    if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(
-            all_gather_group=None
-        )
-        assert tensor_dict is not None, (
-            "edge_cloud_broadcast_recv_with_metadata: PP tensor_dict is None, "
-            "sender may have failed."
-        )
-        metadata_list, _ = _split_tensor_dict(tensor_dict)
-        tp_group.broadcast_object(metadata_list, src=0)
-
-        def broadcast_postprocess() -> None:
-            for fn in comm_postprocess:
-                fn()
-            _, tensor_list = _split_tensor_dict(tensor_dict)
-            handles = []
-            for tensor in tensor_list:
-                if tensor.numel() == 0:
-                    continue
-                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
-                handles.append(
-                    torch.distributed.broadcast(
-                        tensor, src=tp_group.ranks[0], group=group, async_op=True
-                    )
-                )
-            for handle in handles:
-                handle.wait()
-            if sp_chunk:
-                _apply_sp_chunk_inplace(tensor_dict)
-
-        return tensor_dict, comm_handles, [broadcast_postprocess]
-
-    metadata_list = tp_group.broadcast_object(None, src=0)
-    recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
-    for key, value in metadata_list:
-        if isinstance(value, TensorMetadata):
-            recv_tensor_dict[key] = torch.empty(
-                value.size, dtype=value.dtype, device=value.device
-            )
-        else:
-            recv_tensor_dict[key] = value
-
-    def broadcast_postprocess() -> None:
-        handles = []
-        for tensor in recv_tensor_dict.values():
-            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
-                continue
-            group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
-            handles.append(
-                torch.distributed.broadcast(
-                    tensor, src=tp_group.ranks[0], group=group, async_op=True
-                )
-            )
-        for handle in handles:
-            handle.wait()
-        if sp_chunk:
-            _apply_sp_chunk_inplace(recv_tensor_dict)
 
     return recv_tensor_dict, [], [broadcast_postprocess]
