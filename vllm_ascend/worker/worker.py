@@ -67,6 +67,7 @@ from vllm_ascend.distributed.parallel_state import (
     init_edge_cloud_tensor_meta,
 )
 from vllm_ascend.edge_cloud_materialized import (
+    edge_cloud_hc_mult_from_config,
     supports_single_hidden_boundary_for_config,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -383,7 +384,7 @@ class NPUWorker(WorkerBase):
             # DeepSeek V4 uses hc_mult > 1 (HC mechanism produces 3D
             # intermediate tensors).  Standard models (Qwen3.5, Llama,
             # etc.) do not have hc_mult, defaulting to 1 (2D tensors).
-            hc_mult = getattr(self.model_config.hf_text_config, 'hc_mult', 1)
+            hc_mult = edge_cloud_hc_mult_from_config(self.model_config)
             init_edge_cloud_tensor_meta(
                 hidden_size=hidden_size,
                 hidden_dtype=hidden_dtype,

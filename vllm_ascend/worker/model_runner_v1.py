@@ -133,6 +133,7 @@ from vllm_ascend.compilation.edge_cloud_compiler import (
     EdgeCloudCompiledSegment,
 )
 from vllm_ascend.edge_cloud_materialized import (
+    edge_cloud_hc_mult_from_config,
     supports_single_hidden_boundary_for_config,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -720,7 +721,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> IntermediateTensors:
         if self._edge_cloud_enabled and self._use_single_hidden_boundary():
             hidden_size = self.model_config.hf_text_config.hidden_size
-            hc_mult = getattr(self.model_config.hf_text_config, "hc_mult", 1)
+            hc_mult = edge_cloud_hc_mult_from_config(self.model_config)
             if hc_mult > 1:
                 hidden_shape = (batch_size, hc_mult, hidden_size)
             else:

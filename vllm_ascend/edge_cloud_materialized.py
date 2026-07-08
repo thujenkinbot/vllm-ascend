@@ -56,6 +56,20 @@ def supports_single_hidden_boundary_for_config(model_config: Any) -> bool:
     )
 
 
+def edge_cloud_hc_mult_from_config(model_config: Any) -> int:
+    # DeepSeek-V4 model construction uses hf_config directly.  Some Flash
+    # configs expose a stale/different hc_mult on hf_text_config, so prefer the
+    # same config object that the model uses for parameter shapes and forward.
+    for config in (
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+    ):
+        hc_mult = getattr(config, "hc_mult", None)
+        if hc_mult is not None:
+            return int(hc_mult)
+    return 1
+
+
 def uses_materialized_boundary(model: Any) -> bool:
     if getattr(model, "_vllm_ascend_materialized_pp_boundary", False):
         return True
