@@ -560,14 +560,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # reorder the attn_keys and stor the results in _ATTN_KEYS_BUFFER.
                 attn_keys_length = len(graph_params.attn_params[num_tokens])
                 global _ATTN_KEYS_BUFFER
-                if _ATTN_KEYS_BUFFER is None:
+                # In edge-cloud mode, different segments have different attn_keys.
+                # Recompute the buffer when the current keys don't match the cached one.
+                current_keys = attn_keys[:attn_keys_length]
+                if _ATTN_KEYS_BUFFER is None or list(_ATTN_KEYS_BUFFER) != current_keys:
                     import regex as re
 
                     def extract_layer_index(key: str) -> int:
                         match = re.search(r"(\d+)", key)
                         return int(match.group(1)) if match else 0
 
-                    attn_keys_tmp = attn_keys[:attn_keys_length]
+                    attn_keys_tmp = current_keys[:]
                     attn_keys_tmp.sort(key=extract_layer_index)
                     _ATTN_KEYS_BUFFER = attn_keys_tmp
                 attn_keys[:attn_keys_length] = _ATTN_KEYS_BUFFER

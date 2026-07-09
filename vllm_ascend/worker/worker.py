@@ -32,9 +32,21 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    Handle,
+    get_pp_group,
+    get_tp_group,
+)
+
+from vllm_ascend.distributed.parallel_state import (
+    is_cloud_device,
+    is_edge_device,
+    is_edge_cloud_pp_mode,
+)
+
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
@@ -52,7 +64,13 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import (
+    edge_cloud_broadcast_recv,
+    edge_cloud_isend_tensor_dict,
+    get_edge_cloud_tensor_meta,
+    init_ascend_model_parallel,
+    init_edge_cloud_tensor_meta,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -75,6 +93,31 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+def _detect_has_residual(model_config) -> bool:
+    """Detect whether the model produces a residual tensor in IntermediateTensors.
+
+    Models with residual connections (most decoder-only LLMs) output
+    {"hidden_states": ..., "residual": ...} in IntermediateTensors,
+    while models without residual output only {"hidden_states": ...}.
+
+    Detection strategy: check the model's architecture class for the
+    presence of residual stream handling.
+    """
+    hf_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_config, "model_type", "") if hf_config else ""
+    # Qwen3.5 / Qwen3.5-MoE use residual connections
+    if "qwen3" in model_type:
+        return True
+    # DeepSeek V4 uses hc_pre/hc_post which is equivalent to a residual
+    # stream; its IntermediateTensors always contain both hidden_states
+    # and residual.
+    if model_type == "deepseek_v4":
+        return True
+    # Default: most modern decoder models produce residual
+    # Can be made more specific as more models are supported
+    return True
 
 
 class NPUWorker(WorkerBase):
@@ -110,6 +153,21 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         check_ascend_device_type()
+
+        # ===== Edge-Cloud intercept: init distributed + model-parallel groups
+        # before super().__init__() so that ensure_model_parallel_initialized
+        # sees them already created and skips standard initialization. =====
+        pc = vllm_config.parallel_config
+        if is_edge_cloud_pp_mode():
+            init_distributed_environment(
+                pc.world_size,
+                rank,
+                distributed_init_method,
+                local_rank,
+                "hccl",
+            )
+            self._init_edge_cloud_model_parallel(vllm_config)
+        # ==================================================================
 
         super().__init__(
             vllm_config=vllm_config,
@@ -324,6 +382,34 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+        # Initialize edge-cloud tensor metadata for optimized communication
+        # (skips inter-node metadata sync in irecv_tensor_dict/isend_tensor_dict)
+        if getattr(self.model_runner, '_edge_cloud_enabled', False):
+            hidden_size = self.model_config.hf_text_config.hidden_size
+            # Derive dtype directly from model config (same as MindIE's
+            # self.config.torch_dtype from config.json), instead of
+            # requiring a separate user-configured hidden_dtype.
+            # model_config.dtype is a torch.dtype resolved from the
+            # model's config.json torch_dtype field by _get_and_verify_dtype().
+            hidden_dtype = self.model_config.dtype
+            # DeepSeek V4 layer internally manages residual via hc_pre/hc_post
+            # (layer.forward starts with residual=hidden_states.clone()), so
+            # cross-segment residual transfer is unnecessary.
+            has_residual = _detect_has_residual(self.model_config)
+            if getattr(self.model_config.hf_text_config, 'model_type', '') == 'deepseek_v4':
+                has_residual = False
+            # DeepSeek V4 after hc_head uses 2D tensors for edge-cloud transfer.
+            hc_mult = getattr(self.model_config.hf_text_config, 'hc_mult', 1)
+            if getattr(self.model_config.hf_text_config, 'model_type', '') == 'deepseek_v4':
+                hc_mult = 1
+            init_edge_cloud_tensor_meta(
+                hidden_size=hidden_size,
+                hidden_dtype=hidden_dtype,
+                has_residual=has_residual,
+                hc_mult=hc_mult,
+                mode=self.model_runner.edge_cloud_cfg.mode,
+            )
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -390,12 +476,69 @@ class NPUWorker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
 
+        # For embedding_only edge, the edge device does not actually store KV
+        # cache tensors. Return a very large virtual value so that
+        # get_kv_cache_configs() does not clamp num_blocks to the edge's
+        # (small) available memory. The real num_blocks is determined by cloud.
+        if (
+            self.model_runner.edge_cloud_cfg.enabled
+            and self.model_runner.edge_cloud_cfg.mode == "embedding_only"
+            and self.model_runner.edge_cloud_cfg.role == "edge"
+        ):
+            virtual_memory = 1 << 40  # 1 TiB virtual
+            logger.info(
+                "[EdgeCloud] embedding_only edge using virtual available_memory "
+                "(%.2f GiB) instead of real %.2f GiB to avoid limiting cloud "
+                "KV cache size.",
+                GiB(virtual_memory),
+                GiB(self.available_kv_cache_memory_bytes),
+            )
+            self.available_kv_cache_memory_bytes = virtual_memory
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
 
         return int(self.available_kv_cache_memory_bytes)
+
+    def _all_gather_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """All-gather tensors across the local TP group along sequence dim.
+
+        Used in edge-cloud mode when edge and cloud have different SP sizes.
+        Before cross-PP send, each side must aggregate its SP shards back to
+        the full sequence so the remote side can re-chunk with its own SP size.
+        """
+        tp_group = get_tp_group()
+        pc = self.vllm_config.parallel_config
+        # In edge-cloud mode, ensure the all-gathered length is also padded to
+        # the remote side's TP size so no extra padding is needed after recv.
+        target_tp_size = None
+        if is_edge_cloud_pp_mode():
+            from vllm_ascend.distributed.parallel_state import (
+                get_cloud_npu_count,
+                get_edge_npu_count,
+            )
+            target_tp_size = get_cloud_npu_count() if is_edge_device() else get_edge_npu_count()
+
+        result = {}
+        for key, tensor in tensor_dict.items():
+            if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                gathered = tp_group.all_gather(tensor, dim=0)
+                # Pad sequence to target_tp_size if heterogeneous SP is used
+                if target_tp_size is not None and target_tp_size > 1:
+                    seq_len = gathered.size(0)
+                    remainder = seq_len % target_tp_size
+                    if remainder != 0:
+                        pad_len = target_tp_size - remainder
+                        gathered = torch.nn.functional.pad(gathered, (0, 0, 0, pad_len))
+                result[key] = gathered
+            else:
+                result[key] = tensor
+        return result
 
     def execute_model(
         self,
@@ -412,22 +555,57 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        if forward_pass and not get_pp_group().is_first_rank:
-            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-            # it will conflict with the all-gather operation in flashcomm1.
-            if enable_sp():
-                all_gather_group = None
-            else:
-                all_gather_group = get_tp_group()
-            tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+        if forward_pass:
+            if is_cloud_device():
+                # Pre-compute input preparation while edge runs segment_a.
+                # This overlaps cloud's _update_states, _prepare_inputs,
+                # _determine_batch_execution_and_padding, and
+                # _build_attention_metadata with edge's segment_a forward.
+                # On the merge_payload fast path the per-key tensors are
+                # materialized lazily inside comm_postprocess (after the
+                # merged buffer is split), so SP chunking must run there too
+                # — an eager chunk here would iterate an empty dict, rebind
+                # the variable, and sever the link to the postprocess that
+                # fills the original dict by reference (broken tokens).
+                do_sp_chunk = enable_sp() and (
+                    self.model_runner.edge_cloud_cfg.mode != "embedding_only"
+                    or not self.model_runner.supports_mm_inputs)
+                merge_payload = get_edge_cloud_tensor_meta().merge_payload
+                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    sp_chunk=do_sp_chunk and merge_payload,
+                )
+                self.model_runner.cloud_prepare_early(scheduler_output)
+
+                if do_sp_chunk and not merge_payload:
+                    tensor_dict = {
+                        k: sequence_parallel_chunk(v)
+                        for k, v in tensor_dict.items()
+                    }
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
+            elif not get_pp_group().is_first_rank:
+                # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
+                # it will conflict with the all-gather operation in flashcomm1.
+                if enable_sp():
+                    all_gather_group = None
+                else:
+                    all_gather_group = get_tp_group()
+                tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
+                assert tensor_dict is not None, (
+                    "worker irecv_tensor_dict returned None, "
+                    "previous stage may have failed to send."
+                )
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
 
         if self.profiler is not None:
             self.profiler.step()
@@ -438,17 +616,75 @@ class NPUWorker(WorkerBase):
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
-        assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
-        # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-        # it will conflict with the all-gather operation in flashcomm1.
-        if enable_sp():
-            all_gather_group = None
+        if is_edge_device():
+            # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+            # sequence before cross-PP send so cloud can re-chunk by its SP.
+            if enable_sp() and (self.model_runner.edge_cloud_cfg.mode != "embedding_only"
+                or not self.model_runner.supports_mm_inputs):
+                _gathered = self._all_gather_tensor_dict(output.tensors)
+            else:
+                _gathered = output.tensors
+            if get_pp_group().world_size == 2:
+                # Pass scheduler total so the sender slices off any
+                # cudagraph / SP / DP padding, letting the cloud receiver
+                # allocate buffers from SchedulerOutput.total_num_scheduled_tokens
+                # without an inter-node metadata exchange.
+                self._pp_send_work = edge_cloud_isend_tensor_dict(
+                    _gathered,
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
+            edge_sp = enable_sp()
+            edge_merge = get_edge_cloud_tensor_meta().merge_payload
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                sp_chunk=edge_sp and edge_merge,
+            )
+            if edge_sp and not edge_merge:
+                tensor_dict = {
+                    k: sequence_parallel_chunk(v)
+                    for k, v in tensor_dict.items()
+                }
+            intermediate_tensors = AsyncIntermediateTensors(
+                tensor_dict,
+                comm_handles=comm_handles,
+                comm_postprocess=comm_postprocess,
+            )
+           
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+            if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+                return output
+            return output
+
+        if is_cloud_device():
+            # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+            # sequence before cross-PP send so edge can re-chunk by its SP.
+            if enable_sp():
+                _gathered = self._all_gather_tensor_dict(output.tensors)
+            else:
+                _gathered = output.tensors
+            if get_pp_group().world_size == 2:
+                # Cloud segment_c runs through full transformer layers and
+                # almost always with cudagraph / SP / DP padding enabled, so
+                # output.tensors[k].shape[0] >= scheduler_output.total. Slice
+                # back to the unpadded length on the sender side so the edge
+                # receiver can keep allocating buffers from scheduler total
+                # alone (no metadata wire transfer needed).
+                self._pp_send_work = edge_cloud_isend_tensor_dict(
+                    _gathered,
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
         else:
-            all_gather_group = get_tp_group()
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=all_gather_group,
-        )
+            assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
+            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
+            # it will conflict with the all-gather operation in flashcomm1.
+            if enable_sp():
+                all_gather_group = None
+            else:
+                all_gather_group = get_tp_group()
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=all_gather_group,
+            )
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
@@ -732,12 +968,108 @@ class NPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
 
+    def _init_edge_cloud_model_parallel(self, vllm_config: VllmConfig) -> None:
+        """Execute edge-cloud-specific parallel group initialization.
+
+        This runs *before* ``WorkerBase.__init__`` so that
+        ``ensure_model_parallel_initialized`` detects that the groups
+        are already created and skips the standard grid-based path.
+        """
+        import torch
+        import vllm.distributed.parallel_state as _ps
+        from vllm.distributed.parallel_state import (
+            get_world_group,
+            init_model_parallel_group,
+        )
+
+        pc = vllm_config.parallel_config
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        from vllm_ascend.distributed.parallel_state import (
+            get_cloud_npu_count,
+            get_edge_npu_count,
+            is_edge_device,
+        )
+        edge_npu_count = get_edge_npu_count()
+        is_edge = rank < edge_npu_count
+
+        # Runtime consistency check: platform.py sets _IS_EDGE_DEVICE from role
+        # config; here we verify it matches the actual rank.
+        if is_edge != is_edge_device():
+            raise RuntimeError(
+                f"Edge-cloud role mismatch: rank={rank} suggests "
+                f"{'edge' if is_edge else 'cloud'}, but _IS_EDGE_DEVICE was "
+                f"set to {'edge' if is_edge_device() else 'cloud'} by config. "
+                f"Check --edge-cloud-config role setting."
+            )
+
+        # TP groups: edge vs cloud
+        _ps._TP = init_model_parallel_group(
+            [list(range(edge_npu_count)), list(range(edge_npu_count, world_size))],
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        # PP groups: [0, edge_npu_count] as real PP, others as singletons
+        pp_group_ranks = [0, edge_npu_count]
+        pp_other_ranks = [[r] for r in range(world_size) if r not in (0, edge_npu_count)]
+        _ps._PP = init_model_parallel_group(
+            [pp_group_ranks] + pp_other_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="pp",
+        )
+
+        # DCP / PCP / DP / EP
+        all_ranks = list(range(world_size))
+        for name, ranks_list in [
+            ("dcp", [[r] for r in all_ranks]),
+            ("pcp", [[r] for r in all_ranks]),
+            ("dp", [[r] for r in all_ranks]),
+            ("ep", [list(range(edge_npu_count)), list(range(edge_npu_count, world_size))]),
+        ]:
+            group = init_model_parallel_group(
+                ranks_list,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=(name == "dcp"),
+                group_name=name,
+            )
+            setattr(_ps, f"_{name.upper()}", group)
+
+        # Initialise vllm-ascend-specific groups (mc2 etc.)
+        init_ascend_model_parallel(pc)
+
+        logger.info(
+            "Edge-cloud model parallel initialized: rank=%d, is_edge=%s, "
+            "edge_npu_count=%d, cloud_npu_count=%d",
+            rank,
+            is_edge,
+            edge_npu_count,
+            get_cloud_npu_count(),
+        )
+
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )
+
+        # Edge-cloud: groups already initialized in __init__ via
+        # _init_edge_cloud_model_parallel. Skip standard
+        # ensure_model_parallel_initialized because the edge-cloud PP
+        # group layout is non-uniform (only the PP-boundary ranks form
+        # a 2-rank group; others are singletons), which causes the
+        # pipeline_model_parallel_size assertion to fail on non-0 ranks.
+        if is_edge_cloud_pp_mode():
+            init_ascend_model_parallel(self.parallel_config)
+            ensure_ec_transfer_initialized(self.vllm_config)
+            return
+
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
             self.parallel_config.pipeline_parallel_size,

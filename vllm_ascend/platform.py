@@ -149,6 +149,10 @@ class NPUPlatform(Platform):
                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
 
+            # Monkey-patch EngineArgs.create_engine_config so that edge-cloud
+            # mode bypasses the ``world_size % nnodes == 0`` assertion.
+            cls._patch_engine_args_from_cli()
+
         if not is_310p():
             from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendModelSlimConfig  # noqa: F401
         else:
@@ -283,6 +287,10 @@ class NPUPlatform(Platform):
 
         # initialize ascend config from vllm additional_config
         cls._fix_incompatible_config(vllm_config)
+
+        # Inject edge-cloud fields into parallel_config without modifying
+        # upstream ParallelConfig dataclass (zero-intrusion path).
+        cls._inject_edge_cloud_config(vllm_config)
 
         ascend_config = init_ascend_config(vllm_config)
 
@@ -1034,6 +1042,158 @@ class NPUPlatform(Platform):
                     "the current Ascend backend/runtime model. Resetting to 0."
                 )
                 vllm_config.parallel_config.ubatch_size = 0
+
+    _ENGINE_ARGS_PATCHED = False
+
+    @classmethod
+    def _patch_engine_args_from_cli(cls) -> None:
+        """Patch EngineArgs.create_engine_config so that edge-cloud mode
+        bypasses the upstream ``world_size % nnodes == 0`` assertion.
+
+        Edge-cloud configuration is now driven entirely by environment
+        variables (no longer via additional_config.edge_cloud_config).
+        """
+        import os
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        if cls._ENGINE_ARGS_PATCHED:
+            return
+        cls._ENGINE_ARGS_PATCHED = True
+
+        _original_create_engine_config = EngineArgs.create_engine_config
+
+        def _ascend_create_engine_config(self, *args, **kwargs):
+            is_edge_cloud = os.environ.get(
+                "VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false"
+            ).lower() in ("true", "1")
+
+            if is_edge_cloud:
+                saved_nnodes = self.nnodes
+                self.nnodes = 1
+                try:
+                    return _original_create_engine_config(self, *args, **kwargs)
+                finally:
+                    self.nnodes = saved_nnodes
+            else:
+                return _original_create_engine_config(self, *args, **kwargs)
+
+        EngineArgs.create_engine_config = _ascend_create_engine_config
+
+    @classmethod
+    def _inject_edge_cloud_config(cls, vllm_config: VllmConfig) -> None:
+        """Inject edge-cloud fields into parallel_config via object.__setattr__.
+
+        This avoids requiring upstream vLLM to declare these fields in
+        ParallelConfig (which uses pydantic dataclass with extra='forbid').
+        All configuration is driven from ``additional_config.edge_cloud_config``
+        with optional fallback to environment variables.
+        """
+        import os
+
+        parallel_config = vllm_config.parallel_config
+        additional_config = vllm_config.additional_config
+
+        # Guard: 防止 __post_init__ 重入时重复验证/注入
+        # 第一次成功注入后 _IS_EDGE_DEVICE 已被设为 True/False，后续直接跳过
+        from vllm_ascend.distributed.parallel_state import (
+            is_edge_cloud_pp_mode,
+            set_edge_cloud_npu_counts,
+            set_edge_device_flag,
+        )
+        if is_edge_cloud_pp_mode():
+            return
+
+        # Edge-cloud activation and topology are driven entirely by
+        # environment variables (no longer via additional_config).
+        enabled = os.environ.get(
+            "VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false"
+        ).lower() in ("true", "1")
+        if not enabled:
+            return
+
+        edge_npu = int(os.environ.get("VLLM_ASCEND_EDGE_CLOUD_EDGE_NPU_COUNT", 0))
+        cloud_npu = int(os.environ.get("VLLM_ASCEND_EDGE_CLOUD_CLOUD_NPU_COUNT", 0))
+        role = os.environ.get("VLLM_ASCEND_EDGE_CLOUD_ROLE", "edge")
+        is_edge = role == "edge"
+
+        # Preserve any remaining edge_cloud_config fields (e.g. mode,
+        # edge_head_tail_layers, enable_decode_graph) so that child
+        # processes receive them after deserialization.
+        edge_cloud_cfg = (additional_config or {}).get("edge_cloud_config", {})
+        remaining_cfg = {
+            k: v for k, v in edge_cloud_cfg.items()
+            if k not in ("enabled", "edge_npu_count", "cloud_npu_count", "role")
+        }
+        if remaining_cfg:
+            if additional_config is None:
+                additional_config = {}
+                object.__setattr__(vllm_config, "additional_config", additional_config)
+            additional_config["edge_cloud_config"] = remaining_cfg
+
+        set_edge_device_flag(is_edge)
+        set_edge_cloud_npu_counts(edge_npu, cloud_npu)
+
+        # Validation (mirrors original vllm parallel.py logic)
+        if edge_npu <= 0 or cloud_npu <= 0:
+            raise ValueError(
+                "edge_npu_count and cloud_npu_count must be positive "
+                "when enable_edge_cloud is True."
+            )
+        if edge_npu >= cloud_npu:
+            raise ValueError(
+                f"edge_npu_count ({edge_npu}) must be less than "
+                f"cloud_npu_count ({cloud_npu}) for edge-cloud collaboration."
+            )
+        if parallel_config.pipeline_parallel_size != 1 or parallel_config.tensor_parallel_size != 1:
+            raise ValueError(
+                "pipeline_parallel_size and tensor_parallel_size must be 1 "
+                "in edge-cloud collaboration mode."
+            )
+        if parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "data_parallel_size must be 1 in edge-cloud collaboration mode."
+            )
+
+        # Override parallel topology (mirrors original vllm parallel.py logic)
+        object.__setattr__(parallel_config, "world_size", edge_npu + cloud_npu)
+        object.__setattr__(parallel_config, "pipeline_parallel_size", 2)
+        object.__setattr__(parallel_config, "tensor_parallel_size", edge_npu if is_edge else cloud_npu)
+
+        # Fix nnodes/node_rank so that init_distributed_environment recognises
+        # edge-cloud as a multi-node setup and uses master_addr/master_port.
+        # The upstream create_engine_config temporarily sets nnodes=1 to bypass
+        # ``world_size % nnodes == 0`` assertions, which leaves
+        # parallel_config.nnodes == 1 permanently.
+        object.__setattr__(parallel_config, "nnodes", 2)
+        object.__setattr__(parallel_config, "node_rank", 0 if is_edge else 1)
+
+        logger.info(
+            "Ascend edge-cloud config injected: role=%s, world_size=%d, "
+            "pp_size=%d, tp_size=%d, nnodes=%d, node_rank=%d, edge_npu=%d, cloud_npu=%d",
+            role,
+            parallel_config.world_size,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.tensor_parallel_size,
+            parallel_config.nnodes,
+            parallel_config.node_rank,
+            edge_npu,
+            cloud_npu,
+        )
+
+        # Re-evaluate distributed_executor_backend because the original
+        # ParallelConfig.__post_init__ may have set it to "uni" based on
+        # the default world_size=1 (before edge-cloud overrides).
+        if parallel_config.distributed_executor_backend == "uni":
+            object.__setattr__(
+                parallel_config, "distributed_executor_backend", "mp"
+            )
+            logger.info(
+                "Edge-cloud active: overridden distributed_executor_backend from "
+                "'uni' to 'mp' to match corrected world_size=%d.",
+                parallel_config.world_size,
+            )
+
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:

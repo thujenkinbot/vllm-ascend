@@ -898,6 +898,7 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
@@ -908,6 +909,7 @@ class DeepseekV4Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -959,7 +961,9 @@ class DeepseekV4Model(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            # Edge-cloud may omit residual when layer manages it internally
+            # (DeepSeek V4: layer.forward starts with residual=hidden_states.clone()).
+            residual = intermediate_tensors.tensors.get("residual")
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = None
@@ -1202,6 +1206,8 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
 
             if "sink" in name:
+                if is_pp_missing_parameter(name, self):
+                    continue
                 param = params_dict[name]
                 if enable_dsa_cp():
                     param.data.copy_(loaded_weight)

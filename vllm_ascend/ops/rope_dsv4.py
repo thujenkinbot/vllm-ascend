@@ -138,9 +138,11 @@ class ComplexExpRotaryEmbedding(nn.Module):
             inv_freq = self.precompute_freqs_cis(
                 rotary_dim, max_position_embeddings, max_position_embeddings, base, scaling_factor, beta_fast, beta_slow
             )
+            target_device = current_platform.device_type
+            inv_freq = inv_freq.to(target_device)
             t = torch.arange(
                 max_position_embeddings * scaling_factor,
-                device=current_platform.device_type,
+                device=target_device,
                 dtype=torch.float32,
             )
             freqs = torch.einsum("i,j -> ij", t, inv_freq)

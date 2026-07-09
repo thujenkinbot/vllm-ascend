@@ -219,6 +219,156 @@
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
 #
+# ** 9b. File: platform/patch_edge_cloud.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   Consolidated edge-cloud collaborative inference patches (platform layer).
+#   This file replaces the former patch_edge_cloud_multiproc.py,
+#   patch_models_utils.py, patch_parallel_config.py, patch_parallel_state.py
+#   and patch_shm_broadcast.py.
+#
+#   1. `vllm.v1.executor.multiproc_executor.MultiprocExecutor`
+#    Why:
+#       Edge-cloud mode has a non-uniform rank layout (edge + cloud), so
+#       the standard TP*PP*PCP assertions fail.
+#    How:
+#       Introduce AscendMultiprocExecutor with edge-cloud-aware worker
+#       creation, response_mq collection, and rank/layout overrides.
+#    Future Plan:
+#       Remove when upstream vLLM supports edge-cloud non-uniform PP layout.
+#
+#   2. `vllm.model_executor.models.utils.make_layers`
+#    Why:
+#       Edge-cloud collaborative inference requires non-contiguous layer
+#       assignment (edge owns head+tail, cloud owns middle). Upstream
+#       make_layers only supports contiguous PP ranges.
+#    How:
+#       Monkey-patch make_layers to detect edge-cloud mode via
+#       is_edge_cloud_pp_mode() / get_edge_cloud_layer_range(), build
+#       local layer indices with get_edge_cloud_local_indices(), and
+#       interleave real layers with PPMissingLayer placeholders.
+#    Future Plan:
+#       Remove when upstream vLLM supports non-contiguous PP layer ranges
+#       natively or exposes a backend hook for layer placement.
+#
+#   3. `vllm.config.ParallelConfig.local_world_size`
+#    Why:
+#       In edge-cloud mode local_world_size is not world_size // nnodes;
+#       it depends on the role (edge vs cloud).
+#    How:
+#       Monkey-patch the property getter to return edge_npu_count or
+#       cloud_npu_count when edge-cloud mode is active.
+#    Future Plan:
+#       Remove when upstream ParallelConfig natively supports edge-cloud fields.
+#
+#   4. `vllm.distributed.parallel_state.GroupCoordinator.is_first_rank` /
+#      `is_last_rank` and `destroy_model_parallel`
+#    Why:
+#       PP groups in edge-cloud mode need edge device as first rank and
+#       cloud device as last rank, independent of raw rank index.
+#    How:
+#       Replace property getters; also reset edge-cloud state when
+#       destroy_model_parallel is called.
+#    Future Plan:
+#       Remove when upstream GroupCoordinator natively supports edge-cloud
+#       semantics.
+#
+#   5. `vllm.distributed.device_communicators.shm_broadcast.MessageQueue.
+#      create_from_process_group_single_reader`
+#    Why:
+#       Default same-node detection uses rank // local_size, which breaks
+#       in edge-cloud mode where edge and cloud may be on the same node.
+#    How:
+#       Replace with edge-cloud-aware same-side detection.
+#    Future Plan:
+#       Remove when upstream MessageQueue exposes a same-node hook.
+#
+#   6. `vllm_ascend.distributed.parallel_state.get_edge_cloud_local_indices`
+#    Why:
+#       Helper to compute local layer indices from head_k / tail_k counts.
+#    How:
+#       Lives in parallel_state.py (not a patch), used by the patched
+#       make_layers and any other code that needs layer index computation.
+#
+#   7. `vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size`
+#    Why:
+#       Edge-cloud mode may split layers so that the edge side owns one layer
+#       of a different spec variant, causing per-exact-spec min_num_layers=1
+#       and degenerate per-layer grouping.
+#    How:
+#       Monkey-patch to count layers per spec *type* (class) instead of per
+#       exact-spec match when computing min_num_layers / max_num_layers.
+#    Future Plan:
+#       Remove when upstream supports per-type layer counting or backend hooks.
+#
+#   8. `vllm.v1.core.kv_cache_utils._project_kv_cache_groups_to_worker`
+#    Why:
+#       Edge embedding_only worker has no local attention layers; projecting
+#       an empty worker_spec onto global groups produces empty worker_layer_names
+#       and crashes UniformTypeKVCacheSpecs construction.
+#    How:
+#       Skip groups whose worker_layer_names is empty.
+#    Future Plan:
+#       Remove when upstream handles empty worker specs natively.
+#
+#   9. `vllm.v1.core.kv_cache_utils.get_kv_cache_configs`
+#    Why:
+#       Edge embedding_only worker reports empty spec after static_forward_context
+#       cleanup. Projected groups built from merged full-model spec would fail
+#       the layer-count assertion.
+#    How:
+#       Fallback to merged_kv_cache_specs when worker_spec is empty;
+#       skip the assertion for empty-spec workers.
+#    Future Plan:
+#       Remove when upstream supports empty worker spec fallback natively.
+#
+#   10. `vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config`
+#    Why:
+#       Edge-cloud embedding_only edge worker has empty kv_cache_groups.
+#       Passing all worker configs to the scheduler would produce an invalid
+#       configuration.
+#    How:
+#       Monkey-patch to automatically filter out configs with fewer groups
+#       and keep only the one(s) with the maximum number of groups.
+#    Future Plan:
+#       Remove when upstream vLLM supports backend-specific scheduler config
+#       selection natively.
+#
+#   11. `vllm.v1.core.kv_cache_utils.unify_kv_cache_spec_page_size`
+#    Why:
+#       vLLM's unify_kv_cache_spec_page_size does not correctly handle specs
+#       with page_size_padded set (e.g. after mamba alignment in Ascend).
+#       When block_size is scaled up, page_size_padded must also be scaled
+#       to keep page_size_bytes consistent and avoid assertion failures.
+#    How:
+#       Monkey-patch to scale page_size_padded together with block_size.
+#    Future Plan:
+#       Remove when upstream vLLM handles page_size_padded in
+#       unify_kv_cache_spec_page_size natively.
+#
+#   12. `vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator`
+#    Why:
+#       Edge-cloud embedding_only edge worker has no kv_cache_groups.
+#       The original get_kv_cache_coordinator always returns
+#       AscendHybridKVCacheCoordinator, which fails on empty groups.
+#    How:
+#       Monkey-patch to return KVCacheCoordinatorNoPrefixCache when
+#       kv_cache_groups is empty, and UnitaryKVCacheCoordinator when
+#       there is exactly one group.
+#    Future Plan:
+#       Remove when upstream supports empty kv_cache_groups natively.
+#
+#   12. `vllm.v1.core.kv_cache_coordinator.AscendHybridKVCacheCoordinator.
+#       verify_and_split_kv_cache_groups`
+#    Why:
+#       Edge-cloud embedding_only edge worker may have no kv_cache_groups,
+#       resulting in empty attention_groups. The original assert len > 1 fails.
+#    How:
+#       Monkey-patch to replace the assert with an empty check; set
+#       attention_groups=[], lcm_block_size=hash_block_size and
+#       eagle_attn_group_indices=set() when no groups exist.
+#    Future Plan:
+#       Remove when upstream supports empty kv_cache_groups natively.
+#
 # ** 10. File: platform/patch_kv_cache_interface.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.kv_cache_interface.MLAAttentionSpec`
@@ -324,6 +474,29 @@
 #    Future Plan:
 #       Remove this patch once vllm-ascend upgrades to a vLLM version with the
 #       same DeepSeek V4 thinking behavior.
+#
+# ** 12c. File: platform/patch_kv_cache_coordinator.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.kv_cache_coordinator.AscendHybridKVCacheCoordinator`
+#    Why:
+#       Edge-cloud embedding_only mode: edge worker has no attention layers,
+#       so kv_cache_groups may be empty. The original assert len > 1 fails.
+#    How:
+#       Replace assert with empty check in verify_and_split_kv_cache_groups;
+#       set attention_groups=[], lcm_block_size=hash_block_size and
+#       eagle_attn_group_indices=set() when no groups exist.
+#    Future Plan:
+#       Remove when upstream vLLM supports empty kv_cache_groups natively.
+#
+#   2. `vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator`
+#    Why:
+#       When kv_cache_groups is empty (edge embedding_only), we should use
+#       KVCacheCoordinatorNoPrefixCache instead of a hybrid coordinator.
+#    How:
+#       Add len(kv_cache_config.kv_cache_groups) == 0 condition to the
+#       early-return branch, matching upstream vLLM behavior.
+#    Future Plan:
+#       Remove when upstream vLLM supports empty kv_cache_groups natively.
 #
 # ** 12b. File: platform/patch_minimax_m2_tool_call_parser.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

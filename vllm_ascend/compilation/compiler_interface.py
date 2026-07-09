@@ -205,7 +205,12 @@ class AscendCompiler(CompilerInterface):
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex:
             logger.info("enable_npugraph_ex is enabled, which will bring graph compilation optimization.")
-            assert hasattr(self, "vllm_config")
+            # In the standard flow compute_hash() is called first and stores
+            # vllm_config on self.  Edge-cloud segment compilation may invoke
+            # compile() without a prior compute_hash() call; fall back to the
+            # global ascend config's vllm_config in that case.
+            if not hasattr(self, "vllm_config"):
+                self.vllm_config = get_ascend_config().vllm_config
             return npugraph_ex_compile(
                 graph, example_inputs, compiler_config, self.vllm_config, ascend_compilation_config, compile_range, key
             )

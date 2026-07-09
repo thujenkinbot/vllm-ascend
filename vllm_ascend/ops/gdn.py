@@ -173,48 +173,58 @@ def update_conv1d_graph_params(
                 run_mode,
                 branch,
                 layer_prefix,
-                _,
-                _,
-                _,
+                captured_qsl_host,
+                captured_ci_host,
+                captured_nat_host,
                 q_per_seq,
             ) = param
 
             new_query_start_loc: tuple[int, ...] = ()
             new_cache_indices: tuple[int, ...] = ()
             new_num_accepted: tuple[int, ...] = ()
+            use_captured_fallback = False
 
             if run_mode == 1 and attn_metadata is not None:
                 # get gdn metadata by captured layer_prefix
                 meta = attn_metadata
                 if isinstance(meta, dict):
                     meta = meta.get(layer_prefix, None)
-                    assert isinstance(meta, GDNAttentionMetadata)
+                    if meta is None or not isinstance(meta, GDNAttentionMetadata):
+                        # Fallback: use captured host args if runtime metadata is missing.
+                        # This should only trigger in exceptional edge cases; normally
+                        # the caller should supply unfiltered metadata containing the
+                        # GDN key (see update_full_graph_params).
+                        if captured_qsl_host:
+                            new_query_start_loc = captured_qsl_host
+                            new_cache_indices = captured_ci_host
+                            new_num_accepted = captured_nat_host
+                            use_captured_fallback = True
+                        else:
+                            continue
 
-                if meta is None:
-                    continue
-
-                cap_x_dim0 = int(mixed_qkv.size(0))
-                if branch == "spec" and meta.spec_sequence_masks is not None:
-                    qsl_host, cidx_host, num_accepted_host = get_spec_causal_conv1d_update_host_args(meta)
-                    new_query_start_loc, new_cache_indices, new_num_accepted = _pad_conv1d_host_args_to_capture(
-                        qsl_host,
-                        cidx_host,
-                        num_accepted_host,
-                        cap_x_dim0=cap_x_dim0,
-                        q_per_seq=q_per_seq,
-                        with_num_accepted=True,
-                    )
-                elif branch == "non_spec_decode":
-                    non_sdq_host, non_sd_cidx_host = get_causal_conv1d_update_host_args(meta)
-                    new_query_start_loc, new_cache_indices, _ = _pad_conv1d_host_args_to_capture(
-                        non_sdq_host,
-                        non_sd_cidx_host,
-                        (),
-                        cap_x_dim0=cap_x_dim0,
-                        q_per_seq=q_per_seq,
-                        with_num_accepted=False,
-                    )
-                    new_num_accepted = ()
+                if not use_captured_fallback:
+                    cap_x_dim0 = int(mixed_qkv.size(0))
+                    if branch == "spec" and meta.spec_sequence_masks is not None:
+                        qsl_host, cidx_host, num_accepted_host = get_spec_causal_conv1d_update_host_args(meta)
+                        new_query_start_loc, new_cache_indices, new_num_accepted = _pad_conv1d_host_args_to_capture(
+                            qsl_host,
+                            cidx_host,
+                            num_accepted_host,
+                            cap_x_dim0=cap_x_dim0,
+                            q_per_seq=q_per_seq,
+                            with_num_accepted=True,
+                        )
+                    elif branch == "non_spec_decode":
+                        non_sdq_host, non_sd_cidx_host = get_causal_conv1d_update_host_args(meta)
+                        new_query_start_loc, new_cache_indices, _ = _pad_conv1d_host_args_to_capture(
+                            non_sdq_host,
+                            non_sd_cidx_host,
+                            (),
+                            cap_x_dim0=cap_x_dim0,
+                            q_per_seq=q_per_seq,
+                            with_num_accepted=False,
+                        )
+                        new_num_accepted = ()
 
             torch.npu.graph_task_update_begin(update_stream, handle)
             torch.ops._C_ascend.npu_causal_conv1d_custom(

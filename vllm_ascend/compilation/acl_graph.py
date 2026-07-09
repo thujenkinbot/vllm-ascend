@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -14,7 +16,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
@@ -232,30 +234,162 @@ def update_full_graph_params(
     speculative_config=None,
     num_dcp_pcp_tokens=None,
     draft_attn_metadatas=None,
+    layer_indices: list[int] | None = None,
+    graph_params: GraphParams | None = None,
+    draft_graph_params: GraphParams | None = None,
+    unfiltered_attn_metadata: dict | None = None,
 ):
-    impl_cls = attn_backend.get_impl_cls()
-    impl_cls.update_graph_params(
-        update_stream,
-        forward_context,
-        num_tokens,
-        vllm_config,
-        speculative_config,
-        num_dcp_pcp_tokens,
-        draft_attn_metadatas,
-    )
+    """更新 attention 图参数，供下一次图回放使用。
 
-    from vllm_ascend.ops.gdn import update_conv1d_graph_params
+    标准流程使用全局 GraphParams；边云流程为每个 segment 传入独立
+    GraphParams，避免 segment_a / segment_e 的 task handle 相互错配。
 
-    # For GDN Attention: AscendC operate(conv1d update) update graph params
-    # No patch can be loaded, update method call is temporarily placed here
-    update_conv1d_graph_params(
-        update_stream,
-        forward_context,
-        num_tokens,
-        vllm_config,
-        _EXTRA_CTX.is_draft_model,
-        draft_attn_metadatas,
-    )
+    Args:
+        unfiltered_attn_metadata: 真正未过滤的原始 attn_metadata（含 GDN key）。
+            当上游代码（如 _update_full_graph_params_if_needed）为了 FIA update
+            提前过滤掉了 skip_graph_params_update=True 的 key 时，需要传入此参数
+            以保证 GDN 的 update_conv1d_graph_params 仍能按 layer_prefix 查找。
+    """
+    # Lazy import to avoid circular dependency:
+    # acl_graph_edge_cloud.py imports ACLGraphWrapper / GraphParams from this module,
+    # so we import graph_params_scope inside the function body.
+    from vllm_ascend.compilation.acl_graph_edge_cloud import graph_params_scope
+
+    with graph_params_scope(graph_params, draft_graph_params), set_current_vllm_config(vllm_config):
+        impl_cls = attn_backend.get_impl_cls()
+
+        # Use the caller-supplied unfiltered metadata if available;
+        # otherwise fall back to forward_context.attn_metadata (non-edge-cloud path).
+        unfiltered_metadata = unfiltered_attn_metadata or forward_context.attn_metadata
+        filtered_metadata = None
+
+        if layer_indices is not None:
+            # 强制要求 layer_indices 为升序自然层号，与图捕获时 islice(self.layers)
+            # 的遍历顺序严格一致，防止 zip(attn_keys, attn_params) 错位
+            assert layer_indices == sorted(layer_indices), (
+                "layer_indices must be in ascending natural order to align with "
+                "graph_params.attn_params append order."
+            )
+            filtered_metadata = _filter_attn_metadata_for_layers(
+                forward_context.attn_metadata, layer_indices
+            )
+            forward_context.attn_metadata = filtered_metadata
+
+        try:
+            impl_cls.update_graph_params(
+                update_stream,
+                forward_context,
+                num_tokens,
+                vllm_config,
+                speculative_config,
+                num_dcp_pcp_tokens,
+                draft_attn_metadatas,
+            )
+            # For GDN Attention: AscendC operate(conv1d update) update graph params
+            # _filter_attn_metadata_for_layers drops GDN keys (they do not contain
+            # ".layers.{idx}.self_attn" and are absent from attn_params), but
+            # update_conv1d_graph_params still needs the full metadata dict to look
+            # up layer_prefix.  Temporarily restore the unfiltered metadata.
+            from vllm_ascend.ops.gdn import update_conv1d_graph_params
+            if unfiltered_metadata is not None and unfiltered_metadata is not forward_context.attn_metadata:
+                old_metadata = forward_context.attn_metadata
+                forward_context.attn_metadata = unfiltered_metadata
+                try:
+                    update_conv1d_graph_params(
+                        update_stream,
+                        forward_context,
+                        num_tokens,
+                        vllm_config,
+                        _EXTRA_CTX.is_draft_model,
+                        draft_attn_metadatas,
+                    )
+                finally:
+                    forward_context.attn_metadata = old_metadata
+            else:
+                update_conv1d_graph_params(
+                    update_stream,
+                    forward_context,
+                    num_tokens,
+                    vllm_config,
+                    _EXTRA_CTX.is_draft_model,
+                    draft_attn_metadatas,
+                )
+        finally:
+            if filtered_metadata is not None:
+                forward_context.attn_metadata = unfiltered_metadata
+
+def _filter_attn_metadata_for_layers(
+    attn_metadata: dict,
+    layer_indices: list[int],
+) -> dict:
+    """返回仅包含指定层索引对应条目的 dict，key 顺序与 layer_indices 一致。
+
+    attn_metadata 的 key 格式通常为 ``"model.layers.3.self_attn"``。
+    通过匹配 ``.layers.{idx}.`` 子串来定位目标层。
+
+    重要：边云流程中图捕获按自然层顺序遍历（islice(self.layers)），
+    graph_params.attn_params 也按该顺序追加。因此过滤后必须保持
+    layer_indices 的自然顺序，使 update_graph_params 的 zip 配对
+    与图捕获顺序严格对齐，避免错位。
+    """
+    result: dict = {}
+    skipped_no_key_layers: list[int] = []
+    for idx in layer_indices:
+        needle = f".layers.{idx}."
+        matched_keys = [k for k in attn_metadata if needle in k]
+        if not matched_keys:
+            skipped_no_key_layers.append(idx)
+            continue
+        if len(matched_keys) == 1:
+            # 保持原有单 key 路径不变，兼容 Qwen / MLA / FIA 等模型中
+            # 可能带不同前缀的 ``*.layers.{idx}.self_attn`` key。
+            result[matched_keys[0]] = attn_metadata[matched_keys[0]]
+            continue
+
+        base_keys = [k for k in matched_keys if k.endswith(f".layers.{idx}.self_attn")]
+        if len(base_keys) == 1:
+            result[base_keys[0]] = attn_metadata[base_keys[0]]
+            continue
+
+        # DeepSeekV4 DSA 会为同一层注册多个 KV-cache metadata key，
+        # 如 ``self_attn.attn`` / ``self_attn.swa_cache`` / compressor / indexer。
+        # 这些 key 供 DSA custom op 在 forward 时通过 prefix 过滤使用，
+        # 不参与 full graph attention task update，也不会向
+        # graph_params.attn_params 追加条目。只有确认全部都是 DSA 子 key 时
+        # 才跳过，避免破坏原有多 key 防错逻辑。
+        if _is_dsa_kv_metadata_keys(matched_keys, idx):
+            skipped_no_key_layers.append(idx)
+            continue
+
+        # 边云流程要求每层恰好一个 attention graph-update metadata key，
+        # 以确保 graph_params.attn_params 的追加顺序与过滤后顺序 1:1 对齐。
+        # 未识别的多 key 仍然 fail-fast，避免静默错配导致挂死。
+        raise ValueError(
+            f"Layer {idx} has multiple attention metadata keys: {matched_keys}. "
+            f"This breaks the 1:1 alignment between attn_metadata and attn_params."
+        )
+
+    return result
+
+
+def _is_dsa_kv_metadata_keys(keys: list[str], layer_idx: int) -> bool:
+    dsa_suffixes = {
+        "attn",
+        "swa_cache",
+        "compressor.state_cache",
+        "indexer.k_cache",
+        "indexer.compressor.state_cache",
+    }
+    prefix = f".layers.{layer_idx}.self_attn."
+    suffixes: set[str] = set()
+    for key in keys:
+        if prefix not in key:
+            return False
+        suffix = key.split(prefix, 1)[1]
+        if suffix not in dsa_suffixes:
+            return False
+        suffixes.add(suffix)
+    return bool(suffixes)
 
 
 @dataclass
@@ -288,9 +422,9 @@ def set_graph_params(aclgraph_capture_sizes: list[int]):
 
 
 def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
-    global _graph_params
-    if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = workspace
+    graph_params = get_graph_params()
+    if graph_params is not None:
+        graph_params.workspaces[num_tokens] = workspace
 
 
 def get_graph_params():

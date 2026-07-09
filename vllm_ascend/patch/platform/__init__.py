@@ -38,6 +38,7 @@ import vllm_ascend.patch.platform.patch_deepseek_v4_thinking  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 
+# Multiproc executor patch (EPLB active only).
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
@@ -46,3 +47,9 @@ import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 if envs.VLLM_ASCEND_APPLY_DSV4_PATCH:
     import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
     import vllm_ascend.patch.platform.patch_speculative_config  # noqa
+
+# Edge-cloud collaborative inference patches (platform layer).
+# Only loaded when VLLM_ASCEND_EDGE_CLOUD_ENABLED is set, to avoid
+# monkey-patching non-edge-cloud runs.
+if os.environ.get("VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false").lower() in ("true", "1"):
+    import vllm_ascend.patch.platform.edge_cloud  # noqa
