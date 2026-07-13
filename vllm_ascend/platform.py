@@ -1053,7 +1053,7 @@ class NPUPlatform(Platform):
         Edge-cloud configuration is now driven entirely by environment
         variables (no longer via additional_config.edge_cloud_config).
         """
-        import os
+        from vllm_ascend import envs
 
         from vllm.engine.arg_utils import EngineArgs
 
@@ -1064,9 +1064,7 @@ class NPUPlatform(Platform):
         _original_create_engine_config = EngineArgs.create_engine_config
 
         def _ascend_create_engine_config(self, *args, **kwargs):
-            is_edge_cloud = os.environ.get(
-                "VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false"
-            ).lower() in ("true", "1")
+            is_edge_cloud = envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
 
             if is_edge_cloud:
                 saved_nnodes = self.nnodes
@@ -1089,7 +1087,7 @@ class NPUPlatform(Platform):
         All configuration is driven from ``additional_config.edge_cloud_config``
         with optional fallback to environment variables.
         """
-        import os
+        from vllm_ascend import envs
 
         parallel_config = vllm_config.parallel_config
         additional_config = vllm_config.additional_config
@@ -1106,15 +1104,13 @@ class NPUPlatform(Platform):
 
         # Edge-cloud activation and topology are driven entirely by
         # environment variables (no longer via additional_config).
-        enabled = os.environ.get(
-            "VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false"
-        ).lower() in ("true", "1")
+        enabled = envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
         if not enabled:
             return
 
-        edge_npu = int(os.environ.get("VLLM_ASCEND_EDGE_CLOUD_EDGE_NPU_COUNT", 0))
-        cloud_npu = int(os.environ.get("VLLM_ASCEND_EDGE_CLOUD_CLOUD_NPU_COUNT", 0))
-        role = os.environ.get("VLLM_ASCEND_EDGE_CLOUD_ROLE", "edge")
+        edge_npu = envs.VLLM_ASCEND_EDGE_CLOUD_EDGE_NPU_COUNT
+        cloud_npu = envs.VLLM_ASCEND_EDGE_CLOUD_CLOUD_NPU_COUNT
+        role = envs.VLLM_ASCEND_EDGE_CLOUD_ROLE
         is_edge = role == "edge"
 
         # Preserve any remaining edge_cloud_config fields (e.g. mode,

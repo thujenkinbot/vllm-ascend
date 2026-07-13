@@ -51,5 +51,5 @@ if envs.VLLM_ASCEND_APPLY_DSV4_PATCH:
 # Edge-cloud collaborative inference patches (platform layer).
 # Only loaded when VLLM_ASCEND_EDGE_CLOUD_ENABLED is set, to avoid
 # monkey-patching non-edge-cloud runs.
-if os.environ.get("VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false").lower() in ("true", "1"):
+if envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED:
     import vllm_ascend.patch.platform.edge_cloud  # noqa

@@ -699,16 +699,14 @@ class EdgeCloudConfig:
         user_config: dict | None = None,
         vllm_config: "VllmConfig | None" = None,
     ):
-        import os
+        from vllm_ascend import envs
 
         if user_config is None:
             user_config = {}
         # ``enabled`` and ``role`` are driven entirely by environment variables;
         # they are no longer accepted via additional_config.edge_cloud_config.
-        self.enabled: bool = os.environ.get(
-            "VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false"
-        ).lower() in ("true", "1")
-        self.role: str = os.environ.get("VLLM_ASCEND_EDGE_CLOUD_ROLE", "edge")
+        self.enabled: bool = envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
+        self.role: str = envs.VLLM_ASCEND_EDGE_CLOUD_ROLE
         self.mode: str = user_config.get("mode", "head_tail")
         self.edge_head_tail_layers = user_config.get("edge_head_tail_layers", 1)
         self.enable_decode_graph: bool = user_config.get("enable_decode_graph", False)

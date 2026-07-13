@@ -114,6 +114,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Edge-cloud collaborative inference: master switch. When true, the
+    # edge-cloud patch bundle is loaded and the model is split across
+    # edge/cloud NPUs (head/tail layers on edge, middle on cloud).
+    "VLLM_ASCEND_EDGE_CLOUD_ENABLED": lambda: os.getenv(
+        "VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false").lower() in ("true", "1"),
+    # Edge-cloud role of this process: "edge" (head/tail layers + embedding
+    # and final logits) or "cloud" (middle transformer layers).
+    "VLLM_ASCEND_EDGE_CLOUD_ROLE": lambda: os.getenv("VLLM_ASCEND_EDGE_CLOUD_ROLE", "edge"),
+    # Number of NPUs on the edge side and cloud side. Drives the non-uniform
+    # PP rank layout (edge ranks [0, edge_npu), cloud ranks [edge_npu, ...)).
+    "VLLM_ASCEND_EDGE_CLOUD_EDGE_NPU_COUNT": lambda: int(
+        os.getenv("VLLM_ASCEND_EDGE_CLOUD_EDGE_NPU_COUNT", "0")),
+    "VLLM_ASCEND_EDGE_CLOUD_CLOUD_NPU_COUNT": lambda: int(
+        os.getenv("VLLM_ASCEND_EDGE_CLOUD_CLOUD_NPU_COUNT", "0")),
 }
 
 # end-env-vars-definition

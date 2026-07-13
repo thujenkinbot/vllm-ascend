@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-import os
+from vllm_ascend import envs
 
 from vllm.triton_utils import HAS_TRITON
 
@@ -61,5 +61,5 @@ if _V2_MODEL_RUNNER_SUPPORTED:
     import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
     import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
 
-if os.environ.get("VLLM_ASCEND_EDGE_CLOUD_ENABLED", "false").lower() in ("true", "1"):
+if envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED:
     import vllm_ascend.patch.worker.edge_cloud  # noqa
