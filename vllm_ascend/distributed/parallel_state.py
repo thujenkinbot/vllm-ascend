@@ -322,14 +322,15 @@ def _build_edge_cloud_tensor_meta(
     #   1) at least 2 tensors to merge,
     #   2) all share the same dtype and same non-last-dim shape (the
     #      EdgeCloudTensorMeta path guarantees this — both hidden_states and
-    #      residual share the exact same TensorMetadata),
-    #   3) env switch enabled (default True).
+    #      residual share the exact same TensorMetadata).
+    # Merging is unconditionally enabled whenever these hold: it is strictly
+    # better than per-tensor send/recv (functionally equivalent, saves (N-1)
+    # HCCL P2P RTTs).  There is no manual switch — heterogeneous shapes fall
+    # back to the per-tensor path below automatically.
     # The merged buffer is allocated along dim=-1, so each tensor's contribution
     # is (hidden_size) bytes along that axis. The leading dims (num_tokens for
     # 2D, num_tokens x hc_mult for 3D) are preserved.
-    from vllm_ascend import envs as envs_ascend
-    env_enabled = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD
-    merge_payload = env_enabled and len(tensor_keys) >= 2 and len(send_tensor_keys) >= 2
+    merge_payload = len(tensor_keys) >= 2 and len(send_tensor_keys) >= 2
     merged_dtype: torch.dtype | None = None
     merged_shape_tail: tuple[int, ...] | None = None
     split_sizes: list[int] | None = None
@@ -946,8 +947,7 @@ def edge_cloud_isend_tensor_dict(
                 assert False, (
                     "edge_cloud_isend_tensor_dict: merge_payload=True but "
                     f"tensor '{key}' is missing or empty; re-init "
-                    "EdgeCloudTensorMeta or unset "
-                    "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD."
+                    "EdgeCloudTensorMeta."
                 )
             if num_tokens is not None and value.shape[0] > num_tokens:
                 value = value[:num_tokens]
@@ -970,8 +970,7 @@ def edge_cloud_isend_tensor_dict(
             "edge_cloud_isend_tensor_dict: merged shape tail "
             f"{tuple(merged.shape[1:])} != ec_meta.merged_shape_tail "
             f"{ec_meta.merged_shape_tail}. EdgeCloudTensorMeta is stale or "
-            "was initialized with inconsistent per-tensor shapes; re-init "
-            "it or unset VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD."
+            "was initialized with inconsistent per-tensor shapes; re-init it."
         )
         handle = torch.distributed.isend(
             merged, dst=pp_group.ranks[dst], group=group

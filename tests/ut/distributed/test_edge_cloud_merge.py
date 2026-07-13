@@ -8,8 +8,6 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Unit tests for the edge-cloud payload merge fast path."""
 
-from unittest.mock import patch
-
 import pytest
 import torch
 from vllm.distributed.parallel_state import TensorMetadata
@@ -42,20 +40,17 @@ def _reset_meta():
 # ---------------------------------------------------------------------------
 
 def test_init_meta_merge_enabled_2d():
-    """Standard 2D case: hidden_states + residual cat along dim=-1."""
-    with patch.object(
-        ps.envs_ascend := __import__(
-            "vllm_ascend.envs", fromlist=["VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD"]
-        ),
-        "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD",
-        True,
-    ):
-        ps.init_edge_cloud_tensor_meta(
-            hidden_size=128,
-            hidden_dtype=torch.bfloat16,
-            has_residual=True,
-            hc_mult=1,
-        )
+    """Standard 2D case: hidden_states + residual cat along dim=-1.
+
+    Merging is unconditional whenever >=2 tensors share dtype/shape, so no
+    environment switch is involved.
+    """
+    ps.init_edge_cloud_tensor_meta(
+        hidden_size=128,
+        hidden_dtype=torch.bfloat16,
+        has_residual=True,
+        hc_mult=1,
+    )
     meta = ps.get_edge_cloud_tensor_meta()
     assert meta.tensor_keys == ["hidden_states", "residual"]
     assert meta.merge_payload is True
@@ -94,25 +89,6 @@ def test_init_meta_merge_disabled_single_tensor():
     assert meta.tensor_keys == ["hidden_states"]
     assert meta.merge_payload is False
     assert meta.split_sizes is None
-
-
-def test_init_meta_merge_disabled_via_env(monkeypatch):
-    """Env switch off → merge_payload stays False even with 2 tensors."""
-    monkeypatch.setenv("VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD", "0")
-    # Reload the envs module so the lambda re-reads the env var.
-    import importlib
-
-    import vllm_ascend.envs as envs_ascend
-    importlib.reload(envs_ascend)
-    importlib.reload(ps)
-    ps.init_edge_cloud_tensor_meta(
-        hidden_size=128,
-        hidden_dtype=torch.bfloat16,
-        has_residual=True,
-        hc_mult=1,
-    )
-    meta = ps.get_edge_cloud_tensor_meta()
-    assert meta.merge_payload is False
 
 
 # ---------------------------------------------------------------------------
@@ -234,20 +210,13 @@ def test_init_meta_direction_aware_embedding_only():
 
 def test_init_meta_direction_aware_head_tail():
     """head_tail: both directions carry residual (identical)."""
-    with patch.object(
-        ps.envs_ascend := __import__(
-            "vllm_ascend.envs", fromlist=["VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD"]
-        ),
-        "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD",
-        True,
-    ):
-        ps.init_edge_cloud_tensor_meta(
-            hidden_size=128,
-            hidden_dtype=torch.bfloat16,
-            has_residual=True,
-            hc_mult=1,
-            mode="head_tail",
-        )
+    ps.init_edge_cloud_tensor_meta(
+        hidden_size=128,
+        hidden_dtype=torch.bfloat16,
+        has_residual=True,
+        hc_mult=1,
+        mode="head_tail",
+    )
     e2c = ps.get_edge_cloud_tensor_meta("e2c")
     c2e = ps.get_edge_cloud_tensor_meta("c2e")
     assert e2c.tensor_keys == ["hidden_states", "residual"]

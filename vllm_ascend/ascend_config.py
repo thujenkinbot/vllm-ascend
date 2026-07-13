@@ -712,9 +712,6 @@ class EdgeCloudConfig:
         self.mode: str = user_config.get("mode", "head_tail")
         self.edge_head_tail_layers = user_config.get("edge_head_tail_layers", 1)
         self.enable_decode_graph: bool = user_config.get("enable_decode_graph", False)
-        self.decode_graph_min_tokens: int = user_config.get("decode_graph_min_tokens", 1)
-        self.transfer_config: dict = user_config.get("transfer_config", {})
-        self.hidden_dtype: str = user_config.get("hidden_dtype", "bf16")
         self.cloud_enable_sp: bool = user_config.get("cloud_enable_sp", False)
 
         # Keep a handle to vllm_config so _validate() can inspect orthogonal
