@@ -994,14 +994,15 @@ class NPUWorker(WorkerBase):
         edge_npu_count = get_edge_npu_count()
         is_edge = rank < edge_npu_count
 
-        # Runtime consistency check: platform.py sets _IS_EDGE_DEVICE from role
-        # config; here we verify it matches the actual rank.
+        # Runtime consistency check: verify the role implied by this rank
+        # matches VLLM_ASCEND_EDGE_CLOUD_ROLE (edge ranks < edge_npu_count).
         if is_edge != is_edge_device():
             raise RuntimeError(
                 f"Edge-cloud role mismatch: rank={rank} suggests "
-                f"{'edge' if is_edge else 'cloud'}, but _IS_EDGE_DEVICE was "
-                f"set to {'edge' if is_edge_device() else 'cloud'} by config. "
-                f"Check --edge-cloud-config role setting."
+                f"{'edge' if is_edge else 'cloud'}, but "
+                f"VLLM_ASCEND_EDGE_CLOUD_ROLE indicates "
+                f"{'edge' if is_edge_device() else 'cloud'}. "
+                f"Check the role setting."
             )
 
         # TP groups: edge vs cloud

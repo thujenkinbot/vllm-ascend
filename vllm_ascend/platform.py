@@ -1092,16 +1092,6 @@ class NPUPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         additional_config = vllm_config.additional_config
 
-        # Guard: 防止 __post_init__ 重入时重复验证/注入
-        # 第一次成功注入后 _IS_EDGE_DEVICE 已被设为 True/False，后续直接跳过
-        from vllm_ascend.distributed.parallel_state import (
-            is_edge_cloud_pp_mode,
-            set_edge_cloud_npu_counts,
-            set_edge_device_flag,
-        )
-        if is_edge_cloud_pp_mode():
-            return
-
         # Edge-cloud activation and topology are driven entirely by
         # environment variables (no longer via additional_config).
         enabled = envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
@@ -1126,9 +1116,6 @@ class NPUPlatform(Platform):
                 additional_config = {}
                 object.__setattr__(vllm_config, "additional_config", additional_config)
             additional_config["edge_cloud_config"] = remaining_cfg
-
-        set_edge_device_flag(is_edge)
-        set_edge_cloud_npu_counts(edge_npu, cloud_npu)
 
         # Validation (mirrors original vllm parallel.py logic)
         if edge_npu <= 0 or cloud_npu <= 0:

@@ -1,8 +1,6 @@
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import os
-
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import (
@@ -18,6 +16,8 @@ from vllm.distributed.parallel_state import (
 
 from vllm.logger import logger
 
+from vllm_ascend import envs
+
 # ------------------------------------------------------------------
 # Edge-cloud state query helpers
 # ------------------------------------------------------------------
@@ -26,98 +26,38 @@ from vllm.logger import logger
 # inside vllm-ascend.  ``patch_parallel_state`` reads the edge-cloud flag
 # via the public getters below to override ``GroupCoordinator`` behaviour.
 
-# Edge-cloud runtime state is local to vllm-ascend (no need to monkey-patch
-# into the upstream module).  It is propagated across processes via
-# environment variables so that EngineCore / Worker children spawned by
-# the frontend automatically inherit the configuration.
+# Edge-cloud role / NPU counts are read directly from vllm_ascend.envs.
+# Child processes inherit the parent's environment via the OS spawn/fork
+# semantics, so no runtime state needs to be propagated across processes.
 
-# Environment variable names used for cross-process propagation.
-_ENV_EDGE_DEVICE = "VLLM_ASCEND_EDGE_DEVICE"
-_ENV_EDGE_NPU_COUNT = "VLLM_ASCEND_EDGE_NPU_COUNT"
-_ENV_CLOUD_NPU_COUNT = "VLLM_ASCEND_CLOUD_NPU_COUNT"
-
-# Module-level runtime state (initialised from env on import).
-_IS_EDGE_DEVICE: bool | None = None
-_EDGE_NPU_COUNT: int = 0
-_CLOUD_NPU_COUNT: int = 0
+# Layer-range state, set once during model init by the edge side.
 _EDGE_CLOUD_HEAD_K: int = 0
 _EDGE_CLOUD_TAIL_K: int = 0
 
 
-def _sync_from_env() -> None:
-    """Restore edge-cloud state from environment variables.
-
-    Called once at module import so that child processes automatically
-    pick up the configuration set by the parent process.
-    """
-    global _IS_EDGE_DEVICE, _EDGE_NPU_COUNT, _CLOUD_NPU_COUNT
-    edge_flag = os.environ.get(_ENV_EDGE_DEVICE)
-    if edge_flag is not None:
-        _IS_EDGE_DEVICE = edge_flag == "1"
-        _EDGE_NPU_COUNT = int(os.environ.get(_ENV_EDGE_NPU_COUNT, "0"))
-        _CLOUD_NPU_COUNT = int(os.environ.get(_ENV_CLOUD_NPU_COUNT, "0"))
-
-
-# Auto-sync on import (covers child-process restart / re-import).
-_sync_from_env()
-
-
-def set_edge_device_flag(is_edge: bool | None) -> None:
-    """Set the edge-cloud mode flag.
-
-    ``True``  → this process is the edge device.
-    ``False`` → this process is the cloud device.
-    ``None``  → standard (non edge-cloud) mode.
-    """
-    global _IS_EDGE_DEVICE
-    _IS_EDGE_DEVICE = is_edge
-    if is_edge is None:
-        os.environ.pop(_ENV_EDGE_DEVICE, None)
-    else:
-        os.environ[_ENV_EDGE_DEVICE] = "1" if is_edge else "0"
-
-
-def get_edge_device_flag() -> bool | None:
-    """Return the current edge-cloud mode flag, or ``None`` if not set."""
-    return _IS_EDGE_DEVICE
-
-
-def reset_edge_device_flag() -> None:
-    """Reset the edge-cloud mode flag to ``None``."""
-    global _IS_EDGE_DEVICE
-    _IS_EDGE_DEVICE = None
-    os.environ.pop(_ENV_EDGE_DEVICE, None)
-
-
-def set_edge_cloud_npu_counts(edge: int, cloud: int) -> None:
-    """Store the edge-cloud NPU counts."""
-    global _EDGE_NPU_COUNT, _CLOUD_NPU_COUNT
-    _EDGE_NPU_COUNT = edge
-    _CLOUD_NPU_COUNT = cloud
-    os.environ[_ENV_EDGE_NPU_COUNT] = str(edge)
-    os.environ[_ENV_CLOUD_NPU_COUNT] = str(cloud)
-
-
 def get_edge_npu_count() -> int:
     """Return the edge NPU count."""
-    return _EDGE_NPU_COUNT
+    return envs.VLLM_ASCEND_EDGE_CLOUD_EDGE_NPU_COUNT
 
 
 def get_cloud_npu_count() -> int:
     """Return the cloud NPU count."""
-    return _CLOUD_NPU_COUNT
+    return envs.VLLM_ASCEND_EDGE_CLOUD_CLOUD_NPU_COUNT
 
 
 def is_edge_device() -> bool:
-    return _IS_EDGE_DEVICE is True
+    return (envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
+            and envs.VLLM_ASCEND_EDGE_CLOUD_ROLE == "edge")
 
 
 def is_cloud_device() -> bool:
-    return _IS_EDGE_DEVICE is False
+    return (envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
+            and envs.VLLM_ASCEND_EDGE_CLOUD_ROLE == "cloud")
 
 
 def is_edge_cloud_pp_mode() -> bool:
-    return _IS_EDGE_DEVICE is not None
+    """Whether this process runs in edge-cloud pipeline-parallel mode."""
+    return envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
 
 
 def is_edge_cloud_first_stage(intermediate_tensors) -> bool:
@@ -137,7 +77,7 @@ def get_edge_cloud_layer_range() -> tuple[int, int] | None:
     """Return ``(head_k, tail_k)`` if edge-cloud mode is active,
     or ``None`` otherwise.
     """
-    if _IS_EDGE_DEVICE is None:
+    if not is_edge_cloud_pp_mode():
         return None
     return _EDGE_CLOUD_HEAD_K, _EDGE_CLOUD_TAIL_K
 

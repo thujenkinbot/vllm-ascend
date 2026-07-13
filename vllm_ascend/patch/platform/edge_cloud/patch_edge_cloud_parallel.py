@@ -26,10 +26,8 @@ import logging
 import vllm.distributed.parallel_state as _ps
 
 from vllm_ascend.distributed.parallel_state import (
-    get_edge_device_flag,
     is_cloud_device,
-    is_edge_device,
-    reset_edge_device_flag,
+    is_edge_cloud_pp_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,7 +38,7 @@ logger = logging.getLogger(__name__)
 def _patched_is_first_rank(self):
     if hasattr(self, "_override_is_first_rank"):
         return self._override_is_first_rank
-    if get_edge_device_flag() is not None and getattr(self, "unique_name", "").startswith("pp"):
+    if is_edge_cloud_pp_mode() and getattr(self, "unique_name", "").startswith("pp"):
         return not is_cloud_device()
     return self.rank == self.first_rank
 
@@ -49,24 +47,12 @@ def _patched_is_first_rank(self):
 def _patched_is_last_rank(self):
     if hasattr(self, "_override_is_last_rank"):
         return self._override_is_last_rank
-    if get_edge_device_flag() is not None and getattr(self, "unique_name", "").startswith("pp"):
+    if is_edge_cloud_pp_mode() and getattr(self, "unique_name", "").startswith("pp"):
         return not is_cloud_device()
     return self.rank == self.last_rank
 
 
 _ps.GroupCoordinator.is_first_rank = _patched_is_first_rank
 _ps.GroupCoordinator.is_last_rank = _patched_is_last_rank
-
-# ---- destroy_model_parallel ----
-
-_orig_destroy_model_parallel = _ps.destroy_model_parallel
-
-
-def _ascend_destroy_model_parallel() -> None:
-    _orig_destroy_model_parallel()
-    reset_edge_device_flag()
-
-
-_ps.destroy_model_parallel = _ascend_destroy_model_parallel
 
 logger.debug("patch_edge_cloud_parallel applied successfully")
