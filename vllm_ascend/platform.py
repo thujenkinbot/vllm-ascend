@@ -1092,6 +1092,17 @@ class NPUPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         additional_config = vllm_config.additional_config
 
+        # Re-entry guard. The same VllmConfig's __post_init__ can run more
+        # than once in-process (upstream EngineCore re-invokes it after the
+        # handshake), and worker subprocesses inherit an already-injected
+        # ParallelConfig via serialization. Once injected we must skip: the
+        # validation below requires PP/TP == 1, but the first injection sets
+        # PP=2 / TP=<npu count>, so a second pass would raise. The flag lives
+        # in additional_config so it survives serialization and makes child
+        # processes skip too.
+        if (additional_config or {}).get("_edge_cloud_config_injected"):
+            return
+
         # Edge-cloud activation and topology are driven entirely by
         # environment variables (no longer via additional_config).
         enabled = envs.VLLM_ASCEND_EDGE_CLOUD_ENABLED
@@ -1176,6 +1187,14 @@ class NPUPlatform(Platform):
                 "'uni' to 'mp' to match corrected world_size=%d.",
                 parallel_config.world_size,
             )
+
+        # Mark this config as injected so the re-entry guard above skips
+        # subsequent __post_init__ passes (in-process re-invocation and
+        # serialized child processes).
+        if additional_config is None:
+            additional_config = {}
+            object.__setattr__(vllm_config, "additional_config", additional_config)
+        additional_config["_edge_cloud_config_injected"] = True
 
 
     @classmethod
