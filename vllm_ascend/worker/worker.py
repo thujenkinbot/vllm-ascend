@@ -105,11 +105,11 @@ def _detect_has_residual(model_config) -> bool:
     # Qwen3.5 / Qwen3.5-MoE use residual connections
     if "qwen3" in model_type:
         return True
-    # DeepSeek V4 uses hc_pre/hc_post which is equivalent to a residual
-    # stream; its IntermediateTensors always contain both hidden_states
-    # and residual.
+    # DeepSeek V4 uses hc_pre/hc_post internally, but in the edge-cloud
+    # no-residual variant the residual is recomputed locally per segment and
+    # is no longer transmitted across the network.
     if model_type == "deepseek_v4":
-        return True
+        return False
     # Default: most modern decoder models produce residual
     # Can be made more specific as more models are supported
     return True

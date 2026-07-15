@@ -30,12 +30,15 @@ Scheme: "head-3 / tail-1"
 Key differences from standard Llama-style models:
   - DecoderLayer signature: ``layer(positions, hidden_states, residual,
     llama_4_scaling)`` returns ``(hidden_states, residual)``.
-  - Residual is managed internally via ``hc_pre`` / ``hc_post`` and must be
-    passed across segments through ``IntermediateTensors``.
+  - Residual is managed internally via ``hc_pre`` / ``hc_post``.  In the
+    edge-cloud variant we do **not** pass residual across segments: each
+    segment recomputes its own residual locally from ``hidden_states``.  This
+    avoids transmitting the large residual tensor between edge and cloud,
+    which was causing the cloud-side KV-cache allocation to OOM.
   - Embedding needs ``unsqueeze(-2).repeat(1, hc_mult, 1)``.
   - Tail segment needs ``hc_head()`` + ``norm()``.
-  - Only ``hidden_states`` and ``residual`` are transmitted across the
-    edge-cloud network; ``input_ids`` is kept locally on the edge side.
+  - Only ``hidden_states`` is transmitted across the edge-cloud network;
+    ``input_ids`` is kept locally on the edge side.
 """
 
 from itertools import islice
@@ -69,8 +72,9 @@ def _forward_edge_cloud_segment_v4(
         end_layer: Last layer index to execute (exclusive).
         input_ids: Token IDs for embedding (first segment only).
         positions: Position IDs.
-        intermediate_tensors: Carries ``hidden_states`` and ``residual`` from
-            the previous segment.
+        intermediate_tensors: Carries ``hidden_states`` from the previous
+            segment.  Residual is intentionally omitted; each segment
+            recomputes it locally.
         inputs_embeds: Optional pre-computed embeddings.
 
     Returns:
@@ -97,18 +101,17 @@ def _forward_edge_cloud_segment_v4(
         else:
             hidden_states = self.embed_input_ids(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        residual = None
     else:
         assert intermediate_tensors is not None, (
             "intermediate_tensors required for non-first segment in V4"
         )
         hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
 
     # ----- Execute layers in [start_layer, end_layer) -----
     # llama_4_scaling is currently None because scaling config is not enabled.
     # When enabled, compute it from config (see DeepseekV4Model.forward).
     llama_4_scaling = None
+    residual = None
     for idx, layer in enumerate(islice(self.layers, start_layer, end_layer)):
         hidden_states, residual = layer(
             positions,
@@ -121,14 +124,12 @@ def _forward_edge_cloud_segment_v4(
     # In the "head-3 / tail-1" edge-cloud scheme, all Hash MoE layers reside
     # on the edge side (segment A).  The cloud side (segment C) and the edge
     # tail (segment E) do not need ``input_ids``.  We only pass
-    # ``hidden_states`` and ``residual`` across the network.
+    # ``hidden_states`` across the network; residual is recreated locally by
+    # the next segment's first layer.
 
     if not is_last_segment:
-        # residual keeps its original (n, hc_mult, h) shape, aligned with
-        # standard forward path and make_empty_intermediate_tensors buffer.
         return IntermediateTensors({
             "hidden_states": hidden_states,
-            "residual": residual,
         })
 
     # Last segment: hc_head + norm
