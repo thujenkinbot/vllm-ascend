@@ -87,13 +87,36 @@ class AttentionMaskBuilder310:
         """
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
-        qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
-        qlens = qsl[1:] - qsl[:-1]
-        q_list = qlens.tolist()
-        context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
-        c_list = context_lens.tolist()
-        pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
-        position = torch.tensor(pos_list, dtype=torch.int32, device=device)
+
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        # Under uniform spec decode (MTP/EAGLE) every request shares the same
+        # query_len Q, so each query token's causal mask row is a pure device
+        # function of seq_lens: position[b*Q+q] = seq_lens[b] - Q + q. Computing
+        # it with no host sync is required inside an NPUGraph capture -- the eager
+        # fallback below does a synchronous D2H copy (.to("cpu")) that CANN rejects
+        # on a captured stream (error 107030). arange/view/index_select/clamp are
+        # graph-safe (see vllm_ascend/_310p/ops/fla/gdn_310.py).
+        uniform_q = getattr(attn_metadata, "uniform_decode_query_len", 0)
+        if _EXTRA_CTX.capturing and uniform_q > 0:
+            seq_lens = attn_metadata.seq_lens.to(torch.int32)  # [num_reqs] device, static shape
+            num_reqs = seq_lens.shape[0]
+            q_idx = torch.arange(uniform_q, device=device, dtype=torch.int32)
+            position = seq_lens.view(num_reqs, 1) - uniform_q + q_idx.view(1, uniform_q)
+            # Padding (dummy) requests carry seq_lens=0 on replay, yielding negative
+            # indices; clamp keeps index_select in range. Their attention output is
+            # skipped downstream by logits_indices, so the clamped rows are unused.
+            position = position.reshape(-1).clamp(0, cls.max_seqlen - 1).long()
+        else:
+            # Eager path with synchronous D2H -- legal only outside graph capture.
+            qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
+            qlens = qsl[1:] - qsl[:-1]
+            q_list = qlens.tolist()
+            context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
+            c_list = context_lens.tolist()
+            pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
+            position = torch.tensor(pos_list, dtype=torch.int32, device=device).long()
+
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
         return splitfuse_mask_nz

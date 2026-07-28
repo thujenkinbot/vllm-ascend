@@ -130,6 +130,15 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
             self._fill_query_lens_cpu(num_reqs, query_start_loc_cpu, is_drafting),
         )
 
+        # Stash per-request query len so AttentionMaskBuilder310.get_splitfuse_mask
+        # can build the splitfuse mask purely on-device during NPUGraph capture
+        # (the eager mask path does a synchronous D2H copy that CANN rejects on a
+        # captured stream, error 107030). Same setattr pattern as query_lens_cpu.
+        # MTP/EAGLE only; ngram forces dispatcher q_len=1 at capture time
+        # (model_runner_310p.py) and is out of scope here.
+        if self.speculative_config is not None and self.speculative_config.method != "ngram":
+            setattr(attn_metadata, "uniform_decode_query_len", self.decode_threshold)
+
         # Bind device-side views for in-place graph replay updates.
         attn_metadata.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         attn_metadata.query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
