@@ -47,6 +47,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.request_trace import trace_enabled
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -2264,9 +2265,20 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            # Batch-level NPU forward timing (a batch may hold several requests,
+            # so there is no single request_id here). No-op unless
+            # VLLM_TRACE_REQUEST is set; see vllm/request_trace.py.
+            _fwd_t0 = time.perf_counter_ns() if trace_enabled() else 0
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if trace_enabled():
+                logger.info(
+                    "[trace ascend batch] %-22s dt=%11.3f us  num_tokens=%d",
+                    "forward",
+                    (time.perf_counter_ns() - _fwd_t0) / 1_000,
+                    num_tokens_padded,
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
