@@ -1309,6 +1309,33 @@ class NPUModelRunner(GPUModelRunner):
 
         return IntermediateTensors(synced)
 
+    def _copy_edge_cloud_mrope_positions(
+        self,
+        recv_mrope: torch.Tensor,
+        num_tokens_padded: int,
+    ) -> None:
+        """Copy sequence-major wire M-RoPE positions into the padded buffer.
+
+        Edge-to-cloud transfers contain only real tokens, while DP or graph
+        coordination can increase the cloud-side execution length. Copy the
+        received prefix and initialize the local padding instead of requiring
+        the wire tensor to have the padded execution length.
+        """
+        if recv_mrope.ndim != 2 or recv_mrope.shape[1] != 3:
+            raise RuntimeError(
+                "Invalid edge-cloud M-RoPE tensor shape: expected [N, 3], "
+                f"got {tuple(recv_mrope.shape)}"
+            )
+
+        dst_mrope = self.mrope_positions.gpu[:, :num_tokens_padded]
+        recv_len = min(recv_mrope.shape[0], num_tokens_padded)
+        if recv_len:
+            dst_mrope[:, :recv_len].copy_(
+                recv_mrope[:recv_len].t().contiguous()
+            )
+        if recv_len < num_tokens_padded:
+            dst_mrope[:, recv_len:].zero_()
+
     def _sync_metadata_across_dp(
         self,
         num_tokens: int,
@@ -2773,8 +2800,9 @@ class NPUModelRunner(GPUModelRunner):
                     and "mrope_positions" in recv_intermediate_tensors.tensors):
                 recv_intermediate_tensors.wait_for_comm()
                 recv_mrope = recv_intermediate_tensors.tensors["mrope_positions"]
-                self.mrope_positions.gpu[:, :num_tokens_padded].copy_(
-                    recv_mrope[:num_tokens_padded].t().contiguous()
+                self._copy_edge_cloud_mrope_positions(
+                    recv_mrope,
+                    num_tokens_padded,
                 )
 
             (
@@ -4471,19 +4499,10 @@ class NPUModelRunner(GPUModelRunner):
                     if k == "mrope_positions":
                         continue
                     copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
-                    # Clamp copy_len to the source tensor's actual dim-0 size.
-                    # In edge-cloud mode the received intermediate_tensors may have
-                    # fewer tokens than the padded num_tokens (the sender strips
-                    # padding before transmission).  On GPUs the out-of-bounds
-                    # slice v[:copy_len] is silently clamped, but on NPUs the
-                    # stricter shape check causes a runtime error when dst and src
-                    # shapes differ (e.g. 3D tensors with hc_mult dimension in
-                    # DeepSeek V4).
-                    src_len = v.shape[0]
-                    if copy_len > src_len:
-                        copy_len = src_len
                     dst = self.intermediate_tensors[k][:copy_len]
-                    # Senders may transmit only real tokens; fill graph padding locally.
+                    # Senders transmit only real tokens. Preserve the local
+                    # padded length and initialize its tail instead of
+                    # shortening the destination to the wire tensor length.
                     recv_len = min(v.shape[0], copy_len)
                     if recv_len:
                         dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
