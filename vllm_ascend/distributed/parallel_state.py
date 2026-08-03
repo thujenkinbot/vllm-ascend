@@ -445,6 +445,15 @@ def init_ascend_model_parallel(
     # Declare globals upfront to avoid "used prior to global declaration" errors
     global _MC2
     if parallel_config.enable_edge_cloud:
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        if parallel_config.num_edges > 1:
+            # Multi-edge-cloud: N independent single-NPU edges share one
+            # cloud replica. Build N per-edge PP GroupCoordinators (each
+            # [edge_i, cloud_first]); the cloud first NPU belongs to all
+            # N pairs, each edge to its own. EP (_MC2) follows the 1:1
+            # layout below and is skipped for the MVP (dense model).
+            _init_multi_edge_pp_groups(parallel_config, backend)
+            return
         # In edge-cloud mode, _MC2 is initialized with the same group_ranks as
         # upstream _EP: all edge workers form one EP group and all cloud
         # workers form another. Ranks are arranged by dp instance:
@@ -452,7 +461,6 @@ def init_ascend_model_parallel(
         # P_TP / DYNAMIC_EPLB / fine-grained TP groups are skipped because
         # edge-cloud mode does not use the standard uniform rank layout
         # (DP * PP * PCP * TP).
-        backend = torch.distributed.get_backend(get_world_group().device_group)
         edge_npu_count = parallel_config.edge_npu_count
         cloud_npu_count = parallel_config.cloud_npu_count
         if parallel_config.is_shared_model_edge:
@@ -890,7 +898,7 @@ def _get_edge_cloud_hidden_channel_device_group(
         return pp_group.alt_device_group
     return pp_group.device_group
 
-def warmup_edge_cloud_hidden_channels() -> None:
+def warmup_edge_cloud_hidden_channels(pp_group=None) -> None:
     """Pre-establish every edge-cloud hidden-channel P2P link at startup.
 
     The first isend/irecv on a hidden channel rendezvous the two sides
@@ -906,7 +914,7 @@ def warmup_edge_cloud_hidden_channels() -> None:
     global order -- moves that first-use rendezvous to init time, where
     both sides are guaranteed to arrive in the same order.
     """
-    pp_group = get_pp_group()
+    pp_group = pp_group or get_pp_group()
     if pp_group.world_size != 2:
         return
     if not hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
@@ -962,6 +970,77 @@ def warmup_edge_cloud_hidden_channels() -> None:
     logger.info(
         "[edge-cloud] warmed up hidden channels %s (both directions)",
         [c.value for c in channels],
+    )
+
+
+# Multi-edge-cloud: N per-edge PP GroupCoordinators, one per
+# [edge_i, cloud_first] pair. The cloud first NPU belongs to all N;
+# each edge belongs only to its own. Empty outside multi-edge mode.
+_MULTI_EDGE_PP_GROUPS: list[GroupCoordinator] = []
+
+
+def get_pp_group_for_edge(edge_id: int) -> GroupCoordinator:
+    """Return the per-edge PP GroupCoordinator for multi-edge-cloud.
+
+    In multi-edge mode each ``[edge_i, cloud_first]`` pair is its own
+    GroupCoordinator. The cloud first NPU holds all N (indexed by
+    ``edge_id``); each edge holds only its own (``edge_id`` == its own
+    edge rank). Falls back to the global ``_PP`` when multi-edge is not
+    active (``num_edges == 1``).
+    """
+    if not _MULTI_EDGE_PP_GROUPS:
+        return get_pp_group()
+    assert 0 <= edge_id < len(_MULTI_EDGE_PP_GROUPS), (
+        f"edge_id={edge_id} out of range "
+        f"[0, {len(_MULTI_EDGE_PP_GROUPS)})")
+    return _MULTI_EDGE_PP_GROUPS[edge_id]
+
+
+def _init_multi_edge_pp_groups(parallel_config, backend) -> None:
+    """Build the N per-edge PP GroupCoordinators for multi-edge-cloud.
+
+    For each edge ``i`` creates a GroupCoordinator whose only
+    non-singleton subgroup is ``[edge_i, cloud_first]``; every other
+    rank is a singleton so all ranks participate collectively in each
+    ``new_group`` call inside ``create_alternate_groups`` /
+    ``create_hidden_channel_groups``. Each real pair (world_size == 2,
+    i.e. edge_i and the cloud first NPU) is then warmed up. The cloud
+    first NPU serializes warmup across edges to avoid cross-channel
+    rendezvous deadlock.
+    """
+    global _MULTI_EDGE_PP_GROUPS
+    num_edges = parallel_config.num_edges
+    cloud_npu_count = parallel_config.cloud_npu_count
+    cloud_first = num_edges  # cloud first NPU rank
+    all_ranks = list(range(num_edges + cloud_npu_count))
+    local_rank = get_world_group().local_rank
+    _MULTI_EDGE_PP_GROUPS = []
+    for i in range(num_edges):
+        # [edge_i, cloud_first] is the PP pair; all other ranks are
+        # singletons so every rank belongs to exactly one subgroup and
+        # participates in every collective new_group call.
+        group_ranks_i = [[i, cloud_first]]
+        for r in all_ranks:
+            if r != i and r != cloud_first:
+                group_ranks_i.append([r])
+        gc = init_model_parallel_group(
+            group_ranks_i,
+            local_rank,
+            backend,
+            group_name=f"multi_edge_pp_{i}",
+        )
+        # Collective: every rank must call these for every coordinator.
+        gc.create_alternate_groups(backend)
+        if hasattr(gc, "create_hidden_channel_groups"):
+            gc.create_hidden_channel_groups(backend)
+        _MULTI_EDGE_PP_GROUPS.append(gc)
+    if envs.VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP:
+        for gc in _MULTI_EDGE_PP_GROUPS:
+            if gc.world_size > 1:
+                warmup_edge_cloud_hidden_channels(pp_group=gc)
+    logger.info(
+        "[edge-cloud] multi-edge: built %d per-edge PP groups",
+        len(_MULTI_EDGE_PP_GROUPS),
     )
 
 
@@ -1433,6 +1512,7 @@ def edge_cloud_send_tensor_dict(
     num_tokens: int,
     dst: int | None = None,
     include_mrope: bool = True,
+    pp_group=None,
 ) -> list[Handle]:
     """Send edge-cloud hidden tensors on the selected Phase6 channel."""
     return edge_cloud_isend_tensor_dict_on_hidden_channel(
@@ -1441,6 +1521,7 @@ def edge_cloud_send_tensor_dict(
         num_tokens=num_tokens,
         dst=dst,
         include_mrope=include_mrope,
+        pp_group=pp_group,
     )
 
 
