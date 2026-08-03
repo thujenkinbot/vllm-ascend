@@ -130,6 +130,13 @@ def _patched_engine_core_init(self, *args, **kwargs):
     self._pp_pd_channel = None
     if pd_enabled and getattr(parallel_config, "is_edge_node", False):
         dp_rank = getattr(parallel_config, "data_parallel_rank", 0)
+        # Multi-edge: each edge process is its own DP rank 0, so dp_rank
+        # can't disambiguate ZMQ/TCPStore ports. Use the per-process
+        # edge index instead (VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX).
+        from vllm_ascend import envs as _envs_ascend
+        _edge_idx = _envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+        _port_off = _edge_idx if getattr(
+            parallel_config, "num_edges", 1) > 1 else dp_rank
 
         # Discover the cloud's IP via a one-shot TCPStore. The edge
         # acts as store master on ``master_port + 1 + dp_rank`` so
@@ -141,7 +148,7 @@ def _patched_engine_core_init(self, *args, **kwargs):
         from datetime import timedelta
         _addr_store = dist.TCPStore(
             host_name=parallel_config.master_addr,
-            port=parallel_config.master_port + 1 + dp_rank,
+            port=parallel_config.master_port + 1 + _port_off,
             world_size=2,
             is_master=True,
             timeout=timedelta(seconds=300),
@@ -154,8 +161,8 @@ def _patched_engine_core_init(self, *args, **kwargs):
         # dp_rank: dp_rank 0 → {pre_out, post_out}, dp_rank 1 →
         # {pre_out+2, post_out+2}, etc. The cloud side must mirror
         # this offsetting in its own PPSchedulerZmqChannel setup.
-        pre_out_port = pd_config.pre_out_port + dp_rank * 2
-        post_out_port = pd_config.post_out_port + dp_rank * 2
+        pre_out_port = pd_config.pre_out_port + _port_off * 2
+        post_out_port = pd_config.post_out_port + _port_off * 2
         pre_out = f"tcp://*:{pre_out_port}"
         post_out = f"tcp://{cloud_addr}:{post_out_port}"
         self._pp_pd_channel = PPSchedulerZmqChannel(

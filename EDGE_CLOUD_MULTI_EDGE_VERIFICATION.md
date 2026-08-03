@@ -109,16 +109,24 @@ VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS=<hostA>,<hostB> vllm serve <model> \
 
 ---
 
-## 验证点 D — cloud 服务多 edge（⏳ 待实现：握手 ZMQ fan-in + 调度 round-robin）
+## 验证点 D — cloud 服务多 edge
 
-**子系统**：cloud 同时接入 2 edge 控制流并轮转服务
+**commit**：vllm-ascend（D：握手 ZMQ fan-in + 调度 round-robin）
+**子系统**：cloud 同时接入 2 edge 控制流 + round-robin 轮转服务
 
-**预期 OK 标志**（实现后细化）：
-- cloud 同时连 2 edge（2 套 PRE_OUT/POST_OUT ZMQ，端口 5558/5560 + 5559/5561）。
-- 2 edge 各发请求，cloud 日志显示 `edge_id=0/1` 交替处理，结果各回各 edge。
-- 跨 edge `_active_sliced_prefill` 不冲突（一次只切一个 edge 的 prefill）。
+**OK 标志**：
+- cloud 日志 `PD-separation cloud channels: 2 edge(s)`（建了 2 个 PPSchedulerZmqChannel）
+- 2 edge 各发请求，cloud 日志显示 `edge_id=0/1` 交替处理（round-robin），结果各回各 edge
 
-**待实现后补充**：验证命令、失败排查。
+**怎么验证**：3 节点（edge_0 + edge_1 + cloud）启动，两 edge 各发一个 completion 请求，看是否各正确返回、cloud 日志交替出现两个 edge_id。
+
+**失败排查**：
+| 现象 | 查 |
+|---|---|
+| cloud 只连 1 edge | `VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS`（逗号分隔 2 个地址）+ `--num-edges 2` |
+| edge 报 ZMQ bind 冲突（EADDRINUSE）| `VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX`（edge_0=0、edge_1=1，端口偏移 edge_idx*2）|
+| 请求/响应串到错的 edge | `_maybe_publish_post_out` 是否按 `SO.edge_id` 选 channel；`_stamp_edge_id` 是否在每个 SO 上 |
+| 跨 edge prefill 状态串（layerwise）| `_active_sliced_prefill` 跨 edge 互斥（MVP 时分轮转天然不并发，极端交错可能需 NPU 调优）|
 
 ---
 

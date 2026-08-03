@@ -475,14 +475,30 @@ class PassiveEngineCoreProc:
             )
         self.vllm_config = vllm_config
         self.executor = executor
-        # scheduler_input is any object exposing consume_new_outputs(); in
-        # PD-separation mode this is the cloud-side PPSchedulerZmqChannel.
-        self.passive_scheduler = passive_scheduler_module.PassiveScheduler(
-            vllm_config, scheduler_input, dispatch_policy=dispatch_policy
-        )
-        # Optional POST_OUT (cloud → edge) channel. Only set on the cloud
-        # side in PD-separation mode; left None for the legacy PP path.
-        self._pp_pd_channel = pp_pd_channel
+        # scheduler_input is either a single channel (1:1 / legacy) or a
+        # dict[edge_id, channel] (multi-edge). Normalise to a per-edge
+        # dict so the rest of the class is edge-agnostic. Each channel is
+        # both the PRE_OUT subscriber (consume_new_outputs) and the
+        # POST_OUT publisher (publish).
+        if isinstance(scheduler_input, dict):
+            self._channels: dict[int, Any] = dict(scheduler_input)
+        else:
+            self._channels = {0: scheduler_input}
+        self._session_order: list[int] = sorted(self._channels)
+        # One PassiveScheduler per edge (independent EXPECT_ALTERNATION
+        # state machine). ``self.passive_scheduler`` points at the
+        # "current" edge's scheduler, swapped by step(edge_id) during
+        # round-robin (time-division, no cross-edge batch merging).
+        self._sessions: dict[int, Any] = {
+            eid: passive_scheduler_module.PassiveScheduler(
+                vllm_config, ch, dispatch_policy=dispatch_policy)
+            for eid, ch in self._channels.items()
+        }
+        self._current_edge_id: int = self._session_order[0]
+        self.passive_scheduler = self._sessions[self._current_edge_id]
+        # POST_OUT (cloud → edge) channel of the "current" edge, for
+        # legacy code paths that read self._pp_pd_channel directly.
+        self._pp_pd_channel = self._channels.get(self._current_edge_id)
         if getattr(vllm_config.parallel_config, "enable_edge_cloud", False):
             # PassiveEngineCore runs in a freshly-spawned subprocess; the
             # ``_ASCEND_CONFIG`` singleton may be empty here. ``init_ascend_config``
@@ -527,7 +543,14 @@ class PassiveEngineCoreProc:
             self._cher_hint_sent = set()
         self._idle_sleep_seconds = 0.001
 
-        self._prev_dispatch_req_ids: set[str] = set()
+        # Per-edge "previously dispatched req_ids" so the
+        # _trim_scheduler_output optimiser does not conflate requests
+        # from different edges. self._prev_dispatch_req_ids is the
+        # "current" edge's set (swapped by step(edge_id)).
+        self._prev_dispatch_req_ids_per_edge: dict[int, set[str]] = {
+            eid: set() for eid in self._channels}
+        self._prev_dispatch_req_ids: set[str] = (
+            self._prev_dispatch_req_ids_per_edge[self._current_edge_id])
         self._pending_post_out_by_head_token: dict[str, SchedulerOutput] = {}
         self._published_post_out_tokens: set[str] = set()
 
@@ -572,19 +595,27 @@ class PassiveEngineCoreProc:
                 # )
                 self._maybe_publish_post_out(scheduler_output)
 
-    def step(self) -> bool:
-        """Single tick: poll ZMQ → pick batches → enqueue worker payloads.
+    def step(self, edge_id: int | None = None) -> bool:
+        """Single tick for one edge: poll ZMQ → pick batch → enqueue.
 
-        Batches are dispatched one phase at a time in the order encoded by
-        the configured dispatch policy.
+        In multi-edge mode run_busy_loop calls step(edge_id) round-robin
+        (time-division, no merging). ``edge_id`` selects which edge's
+        PassiveScheduler / POST_OUT channel / prev-dispatch set is active.
 
         Returns:
             True if at least one payload was enqueued, False if the
             scheduler had nothing to dispatch.
         """
-        _t0 = time.monotonic()
-        self._drain_worker_completion_acks()
-        _dt_drain = (time.monotonic() - _t0) * 1000
+        if edge_id is None:
+            edge_id = self._current_edge_id
+        # Switch the "current" edge context so the step body (which reads
+        # self.passive_scheduler / self._pp_pd_channel /
+        # self._prev_dispatch_req_ids) is edge-agnostic.
+        self._current_edge_id = edge_id
+        self.passive_scheduler = self._sessions[edge_id]
+        self._pp_pd_channel = self._channels.get(edge_id)
+        self._prev_dispatch_req_ids = (
+            self._prev_dispatch_req_ids_per_edge[edge_id])
 
         _t0 = time.monotonic()
         self.passive_scheduler.poll_and_classify()
@@ -595,11 +626,11 @@ class PassiveEngineCoreProc:
         _dt_sched = (time.monotonic() - _t0) * 1000
 
         if batch.is_empty():
-            if _dt_drain > 1.0 or _dt_poll > 1.0 or _dt_sched > 1.0:
+            if _dt_poll > 1.0 or _dt_sched > 1.0:
                 logger.info(
-                    "[CLOUD-STEP-EMPTY] drain_acks=%.3f ms, poll=%.3f ms, "
-                    "schedule=%.3f ms",
-                    _dt_drain, _dt_poll, _dt_sched,
+                    "[CLOUD-STEP-EMPTY] poll=%.3f ms, schedule=%.3f ms "
+                    "(edge_id=%d)",
+                    _dt_poll, _dt_sched, edge_id,
                 )
             return False
 
@@ -770,7 +801,12 @@ class PassiveEngineCoreProc:
         SchedulerOutput (still about to be enqueued for the local executor)
         keeps its head-segment ``batch_type``.
         """
-        if self._pp_pd_channel is None:
+        # Multi-edge: route POST_OUT to the channel of the SO's edge_id
+        # (each edge has its own POST_OUT ZMQ channel).
+        _edge_id = getattr(
+            scheduler_output, "edge_id", self._current_edge_id)
+        _ch = self._channels.get(_edge_id)
+        if _ch is None:
             return
         from dataclasses import replace
         bt = scheduler_output.batch_type
@@ -822,16 +858,25 @@ class PassiveEngineCoreProc:
             self._published_post_out_tokens.add(head_token)
         # Echo the head_token back so the edge can correlate the tail
         # segment with its suspended head state.
-        self._pp_pd_channel.publish(tail)
+        _ch.publish(tail)
 
     def run_busy_loop(self) -> None:
-        """Drive `step()` until the executor reports failure or shutdown."""
+        """Drive step() round-robin across edges until failure/shutdown."""
         try:
             while not self.executor.is_failed:
-                if not self.step():
+                # Drain worker completions once per round (not per edge):
+                # acks are keyed by head_token (globally unique), so a
+                # single pass publishes all edges' ready POST_OUTs.
+                self._drain_worker_completion_acks()
+                progressed = False
+                for edge_id in self._session_order:
+                    if self.step(edge_id):
+                        progressed = True
+                if not progressed:
                     time.sleep(self._idle_sleep_seconds)
         finally:
-            self.passive_scheduler.shutdown()
+            for sched in self._sessions.values():
+                sched.shutdown()
 
     @staticmethod
     def run_passive_engine_core(
@@ -923,54 +968,54 @@ class PassiveEngineCoreProc:
                 and _edge_cloud.pd_separation.enabled
             )
             if _pd_enabled:
-                master_addr = vllm_config.parallel_config.master_addr
                 master_port = vllm_config.parallel_config.master_port
-
-                # Report this node's reachable IP to the edge so the
-                # edge can construct POST_OUT's connect endpoint
-                # without a CLI flag. Uses a one-shot TCPStore (edge
-                # = master, cloud = client) on ``master_port + 1 +
-                # dp_rank`` to avoid colliding with the NCCL
-                # rendezvous store on ``master_port``. The cloud
-                # connects only to the edge DP rank it is paired
-                # with.
                 import torch.distributed as dist
                 from datetime import timedelta
                 from vllm.utils.network_utils import get_ip
                 _cloud_ip = get_ip()
-                _dp_rank = getattr(
-                    vllm_config.parallel_config, "data_parallel_rank", 0
-                )
-                _addr_store = dist.TCPStore(
-                    host_name=master_addr,
-                    port=master_port + 1 + _dp_rank,
-                    world_size=2,
-                    is_master=False,
-                    timeout=timedelta(seconds=300),
-                )
-                _addr_store.set("cloud_ip", _cloud_ip)
-                del _addr_store
-
-                # ZMQ ports are offset per DP rank on the edge side
-                # (dp_rank * 2). The cloud mirrors this offsetting.
-                # NOTE: the cloud currently creates a single
-                # PPSchedulerZmqChannel (per dp_rank=0). True
-                # multi-DP cloud support requires N channels inside
-                # PassiveEngineCoreProc.
-                _pre_out_port = pd_config.pre_out_port + _dp_rank * 2
-                _post_out_port = pd_config.post_out_port + _dp_rank * 2
-                post_out_bind = f"tcp://*:{_post_out_port}"
-                pre_out_connect = f"tcp://{master_addr}:{_pre_out_port}"
-                pp_pd_channel = PPSchedulerZmqChannel(
-                    send_endpoint=post_out_bind,
-                    recv_endpoint=pre_out_connect,
-                    name=f"pd-cloud-dp{_dp_rank}",
-                )
-                scheduler_input = pp_pd_channel
+                # Multi-edge: the cloud fans in N edges. Each edge has
+                # its own master_addr; num_edges==1 falls back to the
+                # single master_addr. One PPSchedulerZmqChannel per edge
+                # (ZMQ ports offset by edge_idx*2; TCPStore on
+                # master_port+1+edge_idx, edge=master/cloud=client).
+                _num_edges = getattr(
+                    vllm_config.parallel_config, "num_edges", 1)
+                if _num_edges > 1:
+                    from vllm_ascend import envs as _envs_ascend
+                    _addrs = [
+                        a.strip() for a in
+                        _envs_ascend.VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS.split(
+                            ",") if a.strip()]
+                    if len(_addrs) != _num_edges:
+                        raise RuntimeError(
+                            f"num_edges={_num_edges} but "
+                            f"VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS has "
+                            f"{len(_addrs)} addresses")
+                else:
+                    _addrs = [vllm_config.parallel_config.master_addr]
+                scheduler_input: dict[int, Any] = {}
+                for _edge_idx, _master_addr in enumerate(_addrs):
+                    _addr_store = dist.TCPStore(
+                        host_name=_master_addr,
+                        port=master_port + 1 + _edge_idx,
+                        world_size=2,
+                        is_master=False,
+                        timeout=timedelta(seconds=300),
+                    )
+                    _addr_store.set("cloud_ip", _cloud_ip)
+                    del _addr_store
+                    _pre_out_port = pd_config.pre_out_port + _edge_idx * 2
+                    _post_out_port = pd_config.post_out_port + _edge_idx * 2
+                    scheduler_input[_edge_idx] = PPSchedulerZmqChannel(
+                        send_endpoint=f"tcp://*:{_post_out_port}",
+                        recv_endpoint=f"tcp://{_master_addr}:{_pre_out_port}",
+                        name=f"pd-cloud-edge{_edge_idx}",
+                    )
                 logger.info(
-                    "PD-separation cloud channel: POST_OUT=%s, "
-                    "PRE_OUT=%s (dp_rank=%d)",
-                    post_out_bind, pre_out_connect, _dp_rank,
+                    "PD-separation cloud channels: %d edge(s) "
+                    "(pre_out_base=%s, post_out_base=%s)",
+                    len(scheduler_input),
+                    pd_config.pre_out_port, pd_config.post_out_port,
                 )
 
             if scheduler_input is not None:
@@ -978,7 +1023,6 @@ class PassiveEngineCoreProc:
                 proc = PassiveEngineCoreProc(
                     vllm_config, executor, scheduler_input,
                     dispatch_policy=policy,
-                    pp_pd_channel=pp_pd_channel,
                 )
                 proc.run_busy_loop()
             else:
