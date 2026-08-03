@@ -553,6 +553,56 @@ class PassiveEngineCoreProc:
             self._prev_dispatch_req_ids_per_edge[self._current_edge_id])
         self._pending_post_out_by_head_token: dict[str, SchedulerOutput] = {}
         self._published_post_out_tokens: set[str] = set()
+        # Multi-edge KV isolation: the cloud offsets each edge's block
+        # IDs into its global KV pool by edge_id * (cloud_num_blocks //
+        # num_edges). cloud_num_blocks is read from env (set to the
+        # cloud worker's profiled num_blocks); 0 disables offset.
+        from vllm_ascend import envs as _envs_ascend
+        self._num_edges: int = getattr(
+            vllm_config.parallel_config, "num_edges", 1)
+        self._cloud_num_blocks: int = (
+            _envs_ascend.VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS)
+
+    def _offset_worker_so_block_ids(
+        self, worker_so: SchedulerOutput, edge_id: int,
+    ) -> None:
+        """Multi-edge KV isolation: shift this edge's block IDs into the
+        cloud's global KV pool so two edges don't collide.
+
+        Operates on the *worker copy* (``worker_scheduler_output``)
+        only; the echoed original (``batch.scheduler_output``) keeps
+        local block IDs so the edge tail segment indexes its own small
+        KV pool correctly. No restore is needed anywhere.
+        """
+        if self._num_edges <= 1 or self._cloud_num_blocks <= 0:
+            return
+        stride = self._cloud_num_blocks // self._num_edges
+        offset = edge_id * stride
+        if offset == 0:
+            return
+        assert offset + stride <= self._cloud_num_blocks, (
+            f"edge_id={edge_id} KV offset {offset}+{stride} exceeds "
+            f"cloud_num_blocks={self._cloud_num_blocks}; raise "
+            "VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS")
+        _shift = lambda b: b + offset if b >= 0 else b
+
+        # NewRequestData.block_ids: tuple[list[int], ...] (a req's full
+        # block list, grouped by kv_cache_group). tuple is immutable.
+        for nrd in getattr(worker_so, "scheduled_new_reqs", None) or []:
+            nrd.block_ids = tuple(
+                [_shift(b) for b in g] for g in nrd.block_ids)
+        # CachedRequestData.new_block_ids: list[tuple[list,...] | None]
+        # (newly allocated blocks this step, per req per group).
+        cached = getattr(worker_so, "scheduled_cached_reqs", None)
+        if cached is not None and getattr(cached, "new_block_ids", None):
+            cached.new_block_ids = [
+                (tuple([_shift(b) for b in g] for g in t)
+                 if t is not None else None)
+                for t in cached.new_block_ids]
+        # SchedulerOutput.new_block_ids_to_zero: list[int] | None.
+        nbz = getattr(worker_so, "new_block_ids_to_zero", None)
+        if nbz:
+            worker_so.new_block_ids_to_zero = [_shift(b) for b in nbz]
 
     def _drain_worker_completion_acks(self) -> None:
         """Publish POST_OUT only after cloud workers complete the middle segment."""
@@ -739,6 +789,10 @@ class PassiveEngineCoreProc:
                 batch.scheduler_output,
                 self._prev_dispatch_req_ids,
             )
+            # Multi-edge KV isolation: offset this edge's block IDs into
+            # the cloud's global KV pool (worker copy only; the echoed
+            # original keeps local IDs for the edge tail segment).
+            self._offset_worker_so_block_ids(worker_scheduler_output, edge_id)
             _dt_trim = (time.monotonic() - _t0) * 1000
 
             payload = (

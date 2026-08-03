@@ -130,19 +130,27 @@ VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS=<hostA>,<hostB> vllm serve <model> \
 
 ---
 
-## 验证点 E — KV 隔离（⏳ 实现方案已定，需 NPU 落地）
+## 验证点 E — KV 隔离
 
-**子系统**：两 edge 的 KV block ID 不撞 cloud 单 KV pool（数据正确性，**最关键**）
+**commit**：vllm-ascend（E：cloud 侧 block_id 偏移，方案 B）
+**子系统**：两 edge 的 KV block ID 不撞 cloud 单 pool（数据正确性，**最关键**）
 
-**问题**：两 edge 各自 `kv_cache_manager` 从 0 分配 block ID；cloud 只有一个 KV pool → 同 ID 覆盖 → 输出损坏。
+**实现**（cloud 侧偏移）：cloud 在 `step()` 的 **worker 副本**上把 block IDs `+= edge_id * (cloud_num_blocks // num_edges)`；echo 回 edge 的**原件**保持 local block IDs，所以 edge tail 段索引自己的小 KV pool 无需还原。一处 hook、零还原、零跨节点 num_blocks 协调。覆盖三个字段：`scheduled_new_reqs[].block_ids`、`scheduled_cached_reqs.new_block_ids`、`new_block_ids_to_zero`（-1 空块保留）。`cloud_num_blocks` 从 env `VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS` 读。
 
-**实现方案**（两步，都需 NPU 验证）：
-1. **num_blocks 协调**（前置）：edge 侧 `num_blocks = cloud_num_blocks // num_edges`。需要 edge-cloud 协调 cloud 的总 block 数（新机制：cloud profile 后通过握手/配置告知 edge，或 edge 用配置值）。⚠️ edge 侧目前不知道 cloud_num_blocks，这步需要新增协调通路。
-2. **block_id 偏移**：edge 侧 SO 发 cloud 前（`_publish_pre_out_when_ready` / `_maybe_publish_pre_out` publish 前），把 `scheduled_cached_reqs.block_ids`（tuple[list]）+ `new_block_ids`（list）每个 `+= edge_id * (cloud_num_blocks // num_edges)`（保留 -1 空块）。
+**OK 标志**：2 edge **同时**跑相同 prompt，输出与单 edge baseline **逐 token 一致**（无静默损坏）。
 
-**OK 标志**：2 edge **同时**跑相同 prompt，输出与单 edge baseline **逐 token 一致**（无静默损坏）。这是数据正确性的硬验证。
+**怎么验证**：
+1. cloud 启动看日志 profile 出的 `num_blocks`，设 `VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS=<该值>` 重启 cloud。
+2. 2 edge + cloud，两 edge **同时**发相同 prompt，逐 token 对比输出。
 
-**为什么建议 NPU 落地**：① 需要新的 edge↔cloud num_blocks 协调通路；② block_id 偏移是数据正确性，错一字节就损坏，必须边写边在 NPU 验证偏移/还原对称。盲写完一次到位风险高。
+**失败排查**：
+| 现象 | 查 |
+|---|---|
+| cloud 报 block 越界（assert）| `VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS` 是否 = cloud 实际 profile 的 num_blocks |
+| 输出损坏/乱码 | 偏移字段是否漏（三个都要覆盖）；`SO.edge_id` 是否盖戳 |
+| 单 edge 也偏移（应短路）| `num_edges<=1` 或 `cloud_num_blocks==0` 时 `_offset_worker_so_block_ids` 应直接 return |
+
+**NPU TODO**：`cloud_num_blocks` 目前用 env（手设 profile 值）。可改为惰性 worker RPC（`get_kv_cache_config`）自动同步，去掉手设。
 
 ---
 

@@ -146,6 +146,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # edge). Ignored when num_edges == 1. Example: "10.0.0.1,10.0.0.2".
     "VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS": lambda: os.getenv(
         "VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS", ""),
+    # Multi-edge-cloud: total KV-cache block count of the cloud pool.
+    # Read by the cloud PassiveEngineCore to offset each edge's block
+    # IDs by edge_id * (cloud_num_blocks // num_edges) so two edges
+    # don't collide in the single cloud KV pool. Set to the cloud
+    # worker's profiled num_blocks. 0 disables offset (single-edge).
+    # NPU TODO: replace with a lazy worker RPC (get_kv_cache_config).
+    "VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS": lambda: int(
+        os.getenv("VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS", "0")),
 }
 
 # end-env-vars-definition
