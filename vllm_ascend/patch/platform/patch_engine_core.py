@@ -249,6 +249,11 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
         return
     if not scheduler_output.head_token:
         scheduler_output.head_token = uuid4().hex
+    # Multi-edge-cloud: stamp this edge's index so the cloud can route
+    # by edge_id (select the per-edge PP pair). Defaults to 0.
+    if not getattr(scheduler_output, "edge_id", None):
+        from vllm_ascend import envs as _envs_ascend
+        scheduler_output.edge_id = _envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
 
 
 def _publish_pre_out_when_ready(self) -> None:

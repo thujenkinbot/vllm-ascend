@@ -224,6 +224,13 @@ class NPUWorker(WorkerBase):
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
         self._pp_send_work_by_channel: dict[str, list[Handle]] = {}
+        # Multi-edge-cloud: this edge's 0-based index (None on cloud or
+        # when num_edges == 1). Used to pick the per-edge PP pair.
+        self._my_edge_id: int | None = (
+            envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+            if (getattr(self.parallel_config, "num_edges", 1) > 1
+               and self.parallel_config.is_edge_node)
+            else None)
 
         # [CHER/EHER] Cloud-side hidden early-receive (and its edge-side
         # mirror) cache.  The guard thread posts irecv ahead of the batch's
@@ -1088,11 +1095,13 @@ class NPUWorker(WorkerBase):
             _gathered["mrope_positions"] = (
                 self.model_runner.mrope_positions.gpu[:, :n].t().contiguous()
             )
-        if get_pp_group().world_size == 2:
+        _ec_pp = self._ec_pp_group(scheduler_output)
+        if _ec_pp.world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
-                num_tokens=scheduler_output.total_num_scheduled_tokens, include_mrope=include_mrope),
+                num_tokens=scheduler_output.total_num_scheduled_tokens, include_mrope=include_mrope,
+                pp_group=_ec_pp),
                 channel=channel,
             )
         # Return a placeholder output that carries the request IDs so the
@@ -1117,6 +1126,7 @@ class NPUWorker(WorkerBase):
             num_tokens=scheduler_output.total_num_scheduled_tokens,
             channel=channel,
             sp_chunk=edge_sp,
+            pp_group=self._ec_pp_group(scheduler_output),
         )
 
         intermediate_tensors = AsyncIntermediateTensors(
@@ -1234,6 +1244,7 @@ class NPUWorker(WorkerBase):
                     sp_chunk=do_sp_chunk,
                     src=_recv_src,
                     include_mrope=_cloud_include_mrope,
+                    pp_group=self._ec_pp_group(scheduler_output),
                 )
 
                 self.model_runner.cloud_prepare_early(scheduler_output)
@@ -1275,16 +1286,34 @@ class NPUWorker(WorkerBase):
         # Send intermediate tensors to edge.  In the shared-model topology the
         # edge sits at in-group rank 0, so dst=0 is needed.  Otherwise dst=None
         # resolves to the implicit "next PP rank" which IS the edge.
-        if get_pp_group().world_size > 1:
+        _ec_pp = self._ec_pp_group(scheduler_output)
+        if _ec_pp.world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
             _send_dst = 0 if self.parallel_config.is_shared_model_edge else None
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens,
-                                            dst=_send_dst),
+                                            dst=_send_dst, pp_group=_ec_pp),
                 channel=channel,
             )
         return output
+
+    def _ec_pp_group(self, scheduler_output=None):
+        """Edge-cloud PP group for this step (multi-edge aware).
+
+        Multi-edge: an edge uses its own edge_id; the cloud uses the
+        SchedulerOutput's edge_id. Falls back to the global _PP when
+        multi-edge is not active (num_edges == 1).
+        """
+        if getattr(self.parallel_config, "num_edges", 1) > 1:
+            from vllm_ascend.distributed.parallel_state import (
+                get_pp_group_for_edge)
+            if self._my_edge_id is not None:
+                return get_pp_group_for_edge(self._my_edge_id)
+            eid = (getattr(scheduler_output, "edge_id", 0)
+                   if scheduler_output is not None else 0)
+            return get_pp_group_for_edge(eid)
+        return get_pp_group()
 
     def _execute_model_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
