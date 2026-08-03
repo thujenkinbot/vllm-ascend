@@ -130,13 +130,19 @@ VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS=<hostA>,<hostB> vllm serve <model> \
 
 ---
 
-## 验证点 E — KV 隔离（⏳ 待实现：KV block 按 edge 偏移）
+## 验证点 E — KV 隔离（⏳ 实现方案已定，需 NPU 落地）
 
-**子系统**：两 edge 的 KV block ID 不撞 cloud 单 pool
+**子系统**：两 edge 的 KV block ID 不撞 cloud 单 KV pool（数据正确性，**最关键**）
 
-**预期 OK 标志**：2 edge **同时**跑相同 prompt，输出与单 edge baseline **逐 token 一致**（无静默损坏）。这是数据正确性的硬验证。
+**问题**：两 edge 各自 `kv_cache_manager` 从 0 分配 block ID；cloud 只有一个 KV pool → 同 ID 覆盖 → 输出损坏。
 
-**待实现后补充**：偏移公式、验证命令。
+**实现方案**（两步，都需 NPU 验证）：
+1. **num_blocks 协调**（前置）：edge 侧 `num_blocks = cloud_num_blocks // num_edges`。需要 edge-cloud 协调 cloud 的总 block 数（新机制：cloud profile 后通过握手/配置告知 edge，或 edge 用配置值）。⚠️ edge 侧目前不知道 cloud_num_blocks，这步需要新增协调通路。
+2. **block_id 偏移**：edge 侧 SO 发 cloud 前（`_publish_pre_out_when_ready` / `_maybe_publish_pre_out` publish 前），把 `scheduled_cached_reqs.block_ids`（tuple[list]）+ `new_block_ids`（list）每个 `+= edge_id * (cloud_num_blocks // num_edges)`（保留 -1 空块）。
+
+**OK 标志**：2 edge **同时**跑相同 prompt，输出与单 edge baseline **逐 token 一致**（无静默损坏）。这是数据正确性的硬验证。
+
+**为什么建议 NPU 落地**：① 需要新的 edge↔cloud num_blocks 协调通路；② block_id 偏移是数据正确性，错一字节就损坏，必须边写边在 NPU 验证偏移/还原对称。盲写完一次到位风险高。
 
 ---
 
