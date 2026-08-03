@@ -135,6 +135,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP", "1"))
     ),
+    # Multi-edge-cloud (num_edges > 1): 0-based index identifying which
+    # edge this edge process is. Used for ZMQ/TCPStore port offsetting
+    # (base + edge_idx*2) and for stamping SchedulerOutput.edge_id.
+    # Default 0 (also the value for the single edge in 1:1 topology).
+    "VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX": lambda: int(
+        os.getenv("VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX", "0")),
+    # Multi-edge-cloud: comma-separated list of edge master addresses,
+    # read by the cloud to fan-in N edges (one PPSchedulerZmqChannel per
+    # edge). Ignored when num_edges == 1. Example: "10.0.0.1,10.0.0.2".
+    "VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS": lambda: os.getenv(
+        "VLLM_ASCEND_EDGE_CLOUD_MASTER_ADDRS", ""),
 }
 
 # end-env-vars-definition

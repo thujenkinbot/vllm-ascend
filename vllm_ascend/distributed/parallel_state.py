@@ -973,6 +973,7 @@ def edge_cloud_isend_tensor_dict(
     use_alt_group: bool = False,
     channel: HiddenChannelType | None = None,
     include_mrope: bool = True,
+    pp_group=None,
 ) -> list[Handle]:
     """Send tensor dict without metadata sync (edge-cloud optimized).
 
@@ -1004,7 +1005,7 @@ def edge_cloud_isend_tensor_dict(
             sides must pass the same value (derived from
             step_has_multimodal_req) so sender/receiver agree on the key set.
     """
-    pp_group = get_pp_group()
+    pp_group = pp_group or get_pp_group()
     if pp_group.world_size <= 1:
         return []
 
@@ -1240,6 +1241,7 @@ def edge_cloud_irecv_tensor_dict(
     use_alt_group: bool = False,
     channel: HiddenChannelType | None = None,
     include_mrope: bool = True,
+    pp_group=None,
 ) -> tuple[dict[str, torch.Tensor | Any], list[Handle], list[Callable[[], None]]]:
     """Receive tensor dict without metadata sync (edge-cloud optimized).
 
@@ -1262,7 +1264,7 @@ def edge_cloud_irecv_tensor_dict(
             argument (both derived from step_has_multimodal_req). When False,
             mrope_positions is neither received nor broadcast (text-only batch).
     """
-    pp_group = get_pp_group()
+    pp_group = pp_group or get_pp_group()
     if not torch.distributed.is_initialized() or pp_group.world_size == 1:
         return {}, [], []
 
@@ -1392,6 +1394,7 @@ def edge_cloud_isend_tensor_dict_on_hidden_channel(
     dst: int | None = None,
     num_tokens: int | None = None,
     include_mrope: bool = True,
+    pp_group=None,
 ) -> list[Handle]:
     """Send edge-cloud tensors on a hidden channel without metadata sync."""
     return edge_cloud_isend_tensor_dict(
@@ -1400,6 +1403,7 @@ def edge_cloud_isend_tensor_dict_on_hidden_channel(
         num_tokens=num_tokens,
         channel=channel,
         include_mrope=include_mrope,
+        pp_group=pp_group,
     )
 
 
@@ -1408,6 +1412,7 @@ def edge_cloud_irecv_tensor_dict_on_hidden_channel(
     src: int | None = None,
     num_tokens: int | None = None,
     include_mrope: bool = True,
+    pp_group=None,
 ) -> tuple[dict[str, torch.Tensor | Any], list[Handle], list[Callable[[], None]]]:
     """Receive edge-cloud tensors on a hidden channel without metadata sync."""
     assert num_tokens is not None, (
@@ -1418,6 +1423,7 @@ def edge_cloud_irecv_tensor_dict_on_hidden_channel(
         src=src,
         channel=channel,
         include_mrope=include_mrope,
+        pp_group=pp_group,
     )
 
 
@@ -1506,6 +1512,7 @@ def edge_cloud_broadcast_recv(
     sp_chunk: bool = False,
     src: int | None = None,
     include_mrope: bool = True,
+    pp_group=None,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
@@ -1540,7 +1547,7 @@ def edge_cloud_broadcast_recv(
             argument (both derived from step_has_multimodal_req). When False,
             mrope_positions is neither received nor broadcast (text-only batch).
     """
-    pp_group = get_pp_group()
+    pp_group = pp_group or get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size > 1
     ec_meta = _select_edge_cloud_meta_for_recv()
@@ -1552,6 +1559,7 @@ def edge_cloud_broadcast_recv(
                 num_tokens=num_tokens,
                 src=src,
                 include_mrope=include_mrope,
+                pp_group=pp_group,
             )
         )
         assert tensor_dict is not None, (
