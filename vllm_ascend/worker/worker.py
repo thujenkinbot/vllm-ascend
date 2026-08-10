@@ -158,12 +158,9 @@ class NPUWorker(WorkerBase):
         self._pp_send_work: list[Handle] = []
         self._my_edge_id: int | None = None
         if self.parallel_config.num_edges > 1 and self.parallel_config.is_edge_node:
-            self._my_edge_id = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+            self._my_edge_id = self.parallel_config.node_rank
             if not 0 <= self._my_edge_id < self.parallel_config.num_edges:
-                raise ValueError(
-                    f"VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX={self._my_edge_id} is "
-                    f"outside [0, {self.parallel_config.num_edges})"
-                )
+                raise ValueError(f"edge node_rank={self._my_edge_id} is outside [0, {self.parallel_config.num_edges})")
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:

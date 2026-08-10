@@ -114,10 +114,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         success = False
         try:
             if self.parallel_config.enable_edge_cloud:
-                if self.parallel_config.num_edges > 1 and self.parallel_config.is_edge_node:
-                    global_start_rank = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
-                else:
-                    global_start_rank = 0 if self.parallel_config.is_edge_node else self.parallel_config.edge_npu_count
+                global_start_rank = self.parallel_config.edge_cloud_global_start_rank
             else:
                 global_start_rank = self.local_world_size * self.parallel_config.node_rank_within_dp
 
@@ -222,22 +219,20 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.enable_edge_cloud:
-            if self.parallel_config.num_edges > 1 and self.parallel_config.is_edge_node:
-                return rank == envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
-            return rank == (0 if self.parallel_config.is_edge_node else self.parallel_config.edge_npu_count)
+            return rank == self.parallel_config.edge_cloud_global_start_rank
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def _get_output_rank(self) -> int:
         if self.parallel_config.enable_edge_cloud:
             if self.parallel_config.num_edges > 1 and self.parallel_config.is_edge_node:
-                return envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+                return self.parallel_config.node_rank
             return 0
         return super()._get_output_rank()
 
     def _get_multi_edge_control_client(self) -> MultiEdgeControlClient:
         client = self._multi_edge_control_client
         if client is None:
-            edge_id = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+            edge_id = self.parallel_config.node_rank
             client = MultiEdgeControlClient(
                 edge_id=edge_id,
                 cloud_addr=envs_ascend.VLLM_ASCEND_EDGE_CLOUD_CLOUD_ADDR,
@@ -311,7 +306,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
     ):
         """Execute one edge/cloud RPC using the MVP's serial contract."""
 
-        edge_id = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+        edge_id = self.parallel_config.node_rank
         method_name = method if isinstance(method, str) else None
         edge_only_methods = {"sample_tokens", "take_draft_token_ids"}
         shared_read_methods = {"determine_available_memory", "get_kv_cache_spec"}
@@ -359,7 +354,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             and self.parallel_config.num_edges > 1
             and self.parallel_config.is_edge_node
         ):
-            scheduler_output.edge_id = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+            scheduler_output.edge_id = self.parallel_config.node_rank
         return super().execute_model(scheduler_output, non_block=non_block)
 
     def start_worker_monitor(self, inline=False) -> None:

@@ -62,6 +62,7 @@ else:
     FlexibleArgumentParser = None
 
 _CUSTOM_OP_REGISTERED = False
+_MULTI_EDGE_EXECUTOR_BACKEND = "vllm_ascend.patch.platform.patch_multiproc_executor.AscendMultiprocExecutor"
 
 
 def config_deprecated_logging():
@@ -200,6 +201,17 @@ class NPUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults. Set sp_min_token_num=1 when enable_sp and not set."""
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_edge_cloud and parallel_config.num_edges > 1:
+            if parallel_config.distributed_executor_backend not in (
+                "mp",
+                _MULTI_EDGE_EXECUTOR_BACKEND,
+            ):
+                raise ValueError("multi-edge-cloud requires distributed_executor_backend=mp.")
+            # The generic vLLM executor assigns rank 0 to every edge. Select
+            # the Ascend adapter after CLI parsing, when num_edges is known.
+            parallel_config.distributed_executor_backend = _MULTI_EDGE_EXECUTOR_BACKEND
+
         pass_config = vllm_config.compilation_config.pass_config
         if pass_config.enable_sp and pass_config.sp_min_token_num is None:
             from vllm_ascend.compilation.passes.sequence_parallelism import get_sp_min_token_num

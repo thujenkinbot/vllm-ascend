@@ -24,6 +24,9 @@ class TestNPUPlatform(TestBase):
         mock_vllm_config.compilation_config = MagicMock()
         mock_vllm_config.model_config = MagicMock()
         mock_vllm_config.parallel_config = MagicMock()
+        mock_vllm_config.parallel_config.enable_edge_cloud = False
+        mock_vllm_config.parallel_config.num_edges = 1
+        mock_vllm_config.parallel_config.distributed_executor_backend = "mp"
         mock_vllm_config.cache_config = MagicMock()
         mock_vllm_config.scheduler_config = MagicMock()
         mock_vllm_config.scheduler_config.max_num_seqs = None
@@ -151,6 +154,19 @@ class TestNPUPlatform(TestBase):
 
         self.assertIsNone(vllm_config.compilation_config.max_cudagraph_capture_size)
         self.assertEqual(vllm_config.compilation_config.cudagraph_capture_sizes, [1, 2, 4])
+
+    def test_apply_config_platform_defaults_selects_multi_edge_executor(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.parallel_config.enable_edge_cloud = True
+        vllm_config.parallel_config.num_edges = 2
+        vllm_config.parallel_config.distributed_executor_backend = "mp"
+
+        self.platform.apply_config_platform_defaults(vllm_config)
+
+        self.assertEqual(
+            vllm_config.parallel_config.distributed_executor_backend,
+            "vllm_ascend.patch.platform.patch_multiproc_executor.AscendMultiprocExecutor",
+        )
 
     def test_apply_config_platform_defaults_skips_when_scheduler_max_num_seqs_is_missing(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
