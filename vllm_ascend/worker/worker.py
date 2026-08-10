@@ -60,6 +60,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
     edge_cloud_broadcast_recv,
+    get_pp_group_for_edge,
     init_ascend_model_parallel,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -73,6 +74,10 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.multi_edge import (
+    namespace_cloud_request_ids,
+    offset_cloud_kv_block_ids,
+)
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -151,6 +156,14 @@ class NPUWorker(WorkerBase):
             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.20.2; falling back to v1 model runner.")
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
+        self._my_edge_id: int | None = None
+        if self.parallel_config.num_edges > 1 and self.parallel_config.is_edge_node:
+            self._my_edge_id = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
+            if not 0 <= self._my_edge_id < self.parallel_config.num_edges:
+                raise ValueError(
+                    f"VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX={self._my_edge_id} is "
+                    f"outside [0, {self.parallel_config.num_edges})"
+                )
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -438,11 +451,33 @@ class NPUWorker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
+        if is_cloud_device() and self.parallel_config.num_edges > 1:
+            logger.debug("[EdgeCloud] cloud executing edge_id=%d", scheduler_output.edge_id)
+            namespace_cloud_request_ids(scheduler_output, num_edges=self.parallel_config.num_edges)
+            actual_cloud_num_blocks = self.cache_config.num_gpu_blocks or 0
+            configured_cloud_num_blocks = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS
+            if (
+                configured_cloud_num_blocks > 0
+                and actual_cloud_num_blocks > 0
+                and configured_cloud_num_blocks != actual_cloud_num_blocks
+            ):
+                raise ValueError(
+                    "VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS does not match "
+                    f"the allocated cloud KV cache: {configured_cloud_num_blocks} "
+                    f"!= {actual_cloud_num_blocks}"
+                )
+            offset_cloud_kv_block_ids(
+                scheduler_output,
+                num_edges=self.parallel_config.num_edges,
+                cloud_num_blocks=(configured_cloud_num_blocks or actual_cloud_num_blocks),
+            )
+
+        edge_cloud_pp_group = self._edge_cloud_pp_group(scheduler_output)
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
-                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(pp_group=edge_cloud_pp_group)
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -459,8 +494,7 @@ class NPUWorker(WorkerBase):
                     all_gather_group=all_gather_group
                 )
                 assert tensor_dict is not None, (
-                    "worker irecv_tensor_dict returned None, "
-                    "previous stage may have failed to send."
+                    "worker irecv_tensor_dict returned None, previous stage may have failed to send."
                 )
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
@@ -478,9 +512,9 @@ class NPUWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         if is_edge_device():
-            if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            if edge_cloud_pp_group.world_size == 2:
+                self._pp_send_work = edge_cloud_pp_group.isend_tensor_dict(output.tensors)
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(pp_group=edge_cloud_pp_group)
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -494,10 +528,12 @@ class NPUWorker(WorkerBase):
             return output
 
         if is_cloud_device():
-            if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            if edge_cloud_pp_group.world_size == 2:
+                self._pp_send_work = edge_cloud_pp_group.isend_tensor_dict(output.tensors)
         else:
-            assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
+            assert (
+                parallel_config.distributed_executor_backend != "external_launcher" and not get_pp_group().is_last_rank
+            )
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
             # it will conflict with the all-gather operation in flashcomm1.
             if enable_sp():
@@ -520,6 +556,13 @@ class NPUWorker(WorkerBase):
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
         return output
+
+    def _edge_cloud_pp_group(self, scheduler_output: SchedulerOutput):
+        """Select the PP pair belonging to this scheduling step."""
+        if self.parallel_config.num_edges <= 1:
+            return get_pp_group()
+        edge_id = self._my_edge_id if self._my_edge_id is not None else scheduler_output.edge_id
+        return get_pp_group_for_edge(edge_id)
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -732,6 +775,7 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()

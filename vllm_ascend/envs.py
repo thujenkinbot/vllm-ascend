@@ -114,6 +114,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Multi-edge-cloud: zero-based identity of this edge process. The value is
+    # non-sensitive and must be in [0, num_edges). Default 0 preserves 1:1.
+    "VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX": lambda: int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX", "0")),
+    # Multi-edge-cloud: total number of KV blocks in the shared cloud pool.
+    # The cloud reserves an equal static namespace for every edge. A value of
+    # 0 uses the block count from the allocated worker KV config. Non-sensitive.
+    "VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS": lambda: int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_CLOUD_NUM_BLOCKS", "0")),
+    # Multi-edge-cloud: reachable cloud host used by edge control clients.
+    # Required on edge nodes when num_edges > 1. Non-sensitive.
+    "VLLM_ASCEND_EDGE_CLOUD_CLOUD_ADDR": lambda: os.getenv("VLLM_ASCEND_EDGE_CLOUD_CLOUD_ADDR", ""),
+    # Multi-edge-cloud: trusted control-plane TCP port. Valid range 1..65535;
+    # default 5568. The protocol uses cloudpickle and must not be exposed to an
+    # untrusted network.
+    "VLLM_ASCEND_EDGE_CLOUD_CONTROL_PORT": lambda: int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_CONTROL_PORT", "5568")),
 }
 
 # end-env-vars-definition

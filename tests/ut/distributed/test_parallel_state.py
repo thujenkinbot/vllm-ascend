@@ -17,8 +17,53 @@ from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
     get_otp_group,
     get_p_tp_group,
+    get_pp_group_for_edge,
     init_ascend_model_parallel,
 )
+
+
+def test_init_multi_edge_pp_groups() -> None:
+    config = ParallelConfig(
+        enable_edge_cloud=True,
+        cloud_npu_count=8,
+        num_edges=2,
+        is_edge_node=True,
+        nnodes=3,
+        node_rank=0,
+        distributed_executor_backend="mp",
+    )
+    coordinators = [MagicMock(name=f"group-{index}") for index in range(3)]
+
+    with (
+        patch(
+            "vllm_ascend.distributed.parallel_state.model_parallel_initialized",
+            return_value=False,
+        ),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=10),
+        patch("torch.distributed.get_backend", return_value="hccl"),
+        patch("vllm_ascend.distributed.parallel_state.get_world_group") as world_group,
+        patch(
+            "vllm_ascend.distributed.parallel_state.init_model_parallel_group",
+            side_effect=coordinators,
+        ) as init_group,
+    ):
+        world_group.return_value.local_rank = 0
+        world_group.return_value.device_group = MagicMock()
+
+        init_ascend_model_parallel(config)
+
+        assert init_group.call_args_list[0].args[0] == [
+            [0],
+            [1],
+            list(range(2, 10)),
+        ]
+        assert init_group.call_args_list[1].args[0][0] == [0, 2]
+        assert init_group.call_args_list[2].args[0][0] == [1, 2]
+        assert get_pp_group_for_edge(0) is coordinators[1]
+        assert get_pp_group_for_edge(1) is coordinators[2]
+
+        destroy_ascend_model_parallel()
 
 
 @pytest.fixture

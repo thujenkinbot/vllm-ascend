@@ -1,4 +1,5 @@
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
@@ -37,6 +38,11 @@ _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
 
+# Multi-edge-cloud requires overlapping PP pairs: every edge owns a distinct
+# coordinator with the same cloud leader. A single upstream GroupCoordinator
+# cannot express that topology.
+_MULTI_EDGE_PP_GROUPS: list[GroupCoordinator] = []
+
 
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
@@ -57,12 +63,21 @@ def init_ascend_model_parallel(
         edge_ranks = list(range(edge_npu_count))
         cloud_ranks = list(range(edge_npu_count, world_size))
 
+        mc2_groups = (
+            [[rank] for rank in edge_ranks] + [cloud_ranks]
+            if parallel_config.num_edges > 1
+            else [edge_ranks, cloud_ranks]
+        )
+
         _MC2 = init_model_parallel_group(
-            [edge_ranks, cloud_ranks],
+            mc2_groups,
             get_world_group().local_rank,
             backend,
             group_name="mc2",
         )
+
+        if parallel_config.num_edges > 1:
+            _init_multi_edge_pp_groups(parallel_config, backend)
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow
@@ -325,7 +340,43 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
     return _DYNAMIC_EPLB
 
 
+def get_pp_group_for_edge(edge_id: int) -> GroupCoordinator:
+    """Return the PP coordinator assigned to an edge scheduling step."""
+    if not _MULTI_EDGE_PP_GROUPS:
+        return get_pp_group()
+    if not 0 <= edge_id < len(_MULTI_EDGE_PP_GROUPS):
+        raise ValueError(f"edge_id={edge_id} is outside [0, {len(_MULTI_EDGE_PP_GROUPS)})")
+    return _MULTI_EDGE_PP_GROUPS[edge_id]
+
+
+def _init_multi_edge_pp_groups(parallel_config: ParallelConfig, backend) -> None:
+    """Collectively create one [edge, cloud-leader] coordinator per edge."""
+    global _MULTI_EDGE_PP_GROUPS
+    num_edges = parallel_config.num_edges
+    cloud_first_rank = num_edges
+    all_ranks = list(range(num_edges + parallel_config.cloud_npu_count))
+    local_rank = get_world_group().local_rank
+
+    _MULTI_EDGE_PP_GROUPS = []
+    for edge_id in range(num_edges):
+        group_ranks = [[edge_id, cloud_first_rank]]
+        group_ranks.extend([rank] for rank in all_ranks if rank not in (edge_id, cloud_first_rank))
+        _MULTI_EDGE_PP_GROUPS.append(
+            init_model_parallel_group(
+                group_ranks,
+                local_rank,
+                backend,
+                group_name=f"multi_edge_pp_{edge_id}",
+            )
+        )
+
+
 def destroy_ascend_model_parallel():
+    global _MULTI_EDGE_PP_GROUPS
+    for group in _MULTI_EDGE_PP_GROUPS:
+        group.destroy()
+    _MULTI_EDGE_PP_GROUPS = []
+
     global _MC2
     if _MC2:
         _MC2.destroy()
@@ -382,22 +433,21 @@ def destroy_ascend_model_parallel():
     _DYNAMIC_EPLB = None
 
 
-def edge_cloud_broadcast_recv() -> tuple[
+def edge_cloud_broadcast_recv(
+    pp_group: GroupCoordinator | None = None,
+) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
     """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
-    pp_group = get_pp_group()
+    pp_group = pp_group or get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
 
     if is_pp_npu0:
         tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
-        assert tensor_dict is not None, (
-            "edge_cloud_broadcast_recv: PP tensor_dict is None, "
-            "sender may have failed."
-        )
+        assert tensor_dict is not None, "edge_cloud_broadcast_recv: PP tensor_dict is None, sender may have failed."
 
         metadata_list, _ = _split_tensor_dict(tensor_dict)
         tp_group.broadcast_object(metadata_list, src=0)
@@ -409,11 +459,7 @@ def edge_cloud_broadcast_recv() -> tuple[
                 if tensor.numel() == 0:
                     continue
                 group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
-                handles.append(
-                    torch.distributed.broadcast(
-                        tensor, src=tp_group.ranks[0], group=group, async_op=True
-                    )
-                )
+                handles.append(torch.distributed.broadcast(tensor, src=tp_group.ranks[0], group=group, async_op=True))
             for handle in handles:
                 handle.wait()
 
@@ -438,11 +484,7 @@ def edge_cloud_broadcast_recv() -> tuple[
             if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
                 continue
             group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
-            handles.append(
-                torch.distributed.broadcast(
-                    tensor, src=tp_group.ranks[0], group=group, async_op=True
-                )
-            )
+            handles.append(torch.distributed.broadcast(tensor, src=tp_group.ranks[0], group=group, async_op=True))
         for handle in handles:
             handle.wait()
 
