@@ -65,7 +65,10 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.torch_utils import get_dtype_size, set_default_torch_dtype
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import (
+    CommonAttentionMetadata,
+    reorder_batch_to_split_decodes_and_prefills,
+)
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -4891,6 +4894,44 @@ class NPUModelRunner(GPUModelRunner):
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
+
+    def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
+        """Edge-cloud embedding_only: keep the edge's ``input_batch`` order in
+        sync with the cloud's so the metadata-free e2c tensor transfer stays
+        layout-aligned.
+
+        In embedding_only the edge runs NO attention layers (head_k=tail_k=0),
+        so ``kv_cache_groups`` is empty and the base ``_may_reorder_batch``
+        returns early WITHOUT reordering. The cloud, however, runs the full
+        transformer and its attention backend sets ``reorder_batch_threshold``
+        (=1, or 1 + num_speculative_tokens), so the cloud DOES reorder
+        (``reorder_batch_to_split_decodes_and_prefills`` moves prefills to the
+        end of ``input_batch``). The e2c transfer sends tensors in the edge's
+        order and the cloud reads them in the cloud's order; if only the cloud
+        reorders, the two orders diverge and the cloud reads each request's
+        mrope/hidden from the wrong buffer offset (dec_off mismatch -> wrong
+        RoPE position -> token divergence). Apply the SAME reorder on the
+        edge, using the cloud's threshold, so both sides share an identical
+        ``input_batch`` order.
+        """
+        if (self._edge_cloud_enabled
+                and self.edge_cloud_cfg.mode == "embedding_only"
+                and self.edge_cloud_cfg.role == "edge"):
+            if self.reorder_batch_threshold is not None:
+                threshold = self.reorder_batch_threshold
+            else:
+                # Match the ascend attention backend's decode_threshold
+                # (=1, or 1 + num_speculative_tokens under spec decode).
+                threshold = 1
+                if self.speculative_config is not None:
+                    threshold = 1 + self.speculative_config.num_speculative_tokens
+            reorder_batch_to_split_decodes_and_prefills(
+                self.input_batch,
+                scheduler_output,
+                decode_threshold=threshold,
+            )
+            return
+        super()._may_reorder_batch(scheduler_output)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
