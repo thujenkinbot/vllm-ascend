@@ -67,6 +67,20 @@
 #    Future Plan:
 #       Remove this patch when vLLM fix the issue.
 #
+# ** 4. File: platform/patch_executor_selection.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.executor.abstract.Executor.get_class`
+#    Why:
+#       Multi-edge-cloud requires an executor with node-local message queues
+#       and edge-aware RPC routing, including in headless cloud processes.
+#    How:
+#       Select `AscendMultiprocExecutor` only when multi-edge-cloud is enabled
+#       and delegate every other configuration to vLLM's original selector.
+#    Related PR (if no, explain why):
+#       No, this is an Ascend edge-cloud extension.
+#    Future Plan:
+#       Replace the patch when vLLM provides a platform executor-selection hook.
+#
 # ** 5. File: platform/patch_balance_schedule.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.engine.core.EngineCoreProc.run_engine_core`

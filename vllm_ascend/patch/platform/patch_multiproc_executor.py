@@ -78,6 +78,12 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         # and ModelRunnerOutputs
         multi_edge = self.parallel_config.enable_edge_cloud and self.parallel_config.num_edges > 1
         if multi_edge:
+            logger.info(
+                "Using AscendMultiprocExecutor for multi-edge-cloud: node_rank=%d, role=%s, local_world_size=%d",
+                self.parallel_config.node_rank,
+                "edge" if self.parallel_config.is_edge_node else "cloud",
+                self.local_world_size,
+            )
             if self.scheduler_config.async_scheduling:
                 raise ValueError("multi-edge-cloud MVP requires async_scheduling=False")
             if self.speculative_config is not None:
