@@ -25,6 +25,16 @@ def test_multi_edge_executor_limits_concurrent_batches_to_one() -> None:
     assert executor.max_concurrent_batches == 1
 
 
+def test_multi_edge_allows_multimodal_model_config_for_text_requests() -> None:
+    executor = make_executor()
+    executor.speculative_config = None
+    executor.lora_config = None
+    executor.cache_config = SimpleNamespace(enable_prefix_caching=False)
+    executor.model_config = SimpleNamespace(multimodal_config=object())
+
+    executor._validate_multi_edge_config()
+
+
 def test_multi_edge_non_block_rpc_returns_completed_future() -> None:
     executor = make_executor()
 

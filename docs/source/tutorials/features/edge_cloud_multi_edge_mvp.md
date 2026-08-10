@@ -20,8 +20,10 @@ for the v0.20 executor used on this branch.
   port on every node.
 - The control endpoint uses cloudpickle. Bind it only on a trusted inference
   network and block access from untrusted clients.
-- Dynamic edge join/leave, failure isolation, cross-edge batching, multimodal,
-  speculative decoding, LoRA, and prefix caching are outside this MVP.
+- Multimodal model configurations may start for text-only requests. Image,
+  audio, and video request paths have not been validated in this MVP.
+- Dynamic edge join/leave, failure isolation, cross-edge batching, speculative
+  decoding, LoRA, and prefix caching are outside this MVP.
 
 The global rank layout is:
 

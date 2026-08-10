@@ -84,16 +84,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                 "edge" if self.parallel_config.is_edge_node else "cloud",
                 self.local_world_size,
             )
-            if self.scheduler_config.async_scheduling:
-                raise ValueError("multi-edge-cloud MVP requires async_scheduling=False")
-            if self.speculative_config is not None:
-                raise ValueError("multi-edge-cloud MVP does not support speculative decoding")
-            if self.lora_config is not None:
-                raise ValueError("multi-edge-cloud MVP does not support LoRA")
-            if self.model_config.multimodal_config is not None:
-                raise ValueError("multi-edge-cloud MVP currently supports text models only")
-            if self.cache_config.enable_prefix_caching:
-                raise ValueError("multi-edge-cloud MVP does not support prefix caching")
+            self._validate_multi_edge_config()
         if multi_edge and self.parallel_config.is_edge_node:
             edge_id = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX
             if edge_id != self.parallel_config.node_rank:
@@ -205,6 +196,16 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
         self.output_rank = self._get_output_rank()
         self._multi_edge_control_client: MultiEdgeControlClient | None = None
+
+    def _validate_multi_edge_config(self) -> None:
+        if self.scheduler_config.async_scheduling:
+            raise ValueError("multi-edge-cloud MVP requires async_scheduling=False")
+        if self.speculative_config is not None:
+            raise ValueError("multi-edge-cloud MVP does not support speculative decoding")
+        if self.lora_config is not None:
+            raise ValueError("multi-edge-cloud MVP does not support LoRA")
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError("multi-edge-cloud MVP does not support prefix caching")
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
