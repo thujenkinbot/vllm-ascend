@@ -1,6 +1,7 @@
 [build-system]
 # Should be mirrored in requirements.txt
 requires = [
+    "aiohttp>=3.13.3",
     "attrs",
     "cmake>=3.26",
     "decorator",

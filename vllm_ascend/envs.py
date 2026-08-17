@@ -128,6 +128,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # default 5568. The protocol uses cloudpickle and must not be exposed to an
     # untrusted network.
     "VLLM_ASCEND_EDGE_CLOUD_CONTROL_PORT": lambda: int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_CONTROL_PORT", "5568")),
+    # Edge usage reporter: Higress endpoint receiving content-free JSON usage events.
+    # Required when the reporter middleware is loaded. Non-sensitive.
+    "VLLM_ASCEND_USAGE_REPORT_URL": lambda: os.getenv("VLLM_ASCEND_USAGE_REPORT_URL", ""),
+    # Edge usage reporter: per-edge Key Auth credential sent in x-api-key.
+    # Required when the reporter middleware is loaded. Sensitive; never log it.
+    "VLLM_ASCEND_USAGE_REPORT_API_KEY": lambda: os.getenv("VLLM_ASCEND_USAGE_REPORT_API_KEY", ""),
+    # Edge usage reporter: stable edge name used in telemetry. Empty derives
+    # edge-{VLLM_ASCEND_EDGE_CLOUD_EDGE_IDX}. Non-sensitive.
+    "VLLM_ASCEND_USAGE_REPORT_EDGE_ID": lambda: os.getenv("VLLM_ASCEND_USAGE_REPORT_EDGE_ID", ""),
+    # Edge usage reporter: served model name included in telemetry metadata.
+    # Required when the reporter middleware is loaded. Non-sensitive.
+    "VLLM_ASCEND_USAGE_REPORT_MODEL": lambda: os.getenv("VLLM_ASCEND_USAGE_REPORT_MODEL", ""),
 }
 
 # end-env-vars-definition

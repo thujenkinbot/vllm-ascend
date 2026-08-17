@@ -1,0 +1,80 @@
+# Replace both credentials before applying this example. The Ingress route
+# receiving usage reports must be named "edge-usage".
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: edge-usage-key-auth
+  namespace: higress-system
+spec:
+  defaultConfig:
+    global_auth: false
+    consumers:
+      - credential: CHANGE_ME_EDGE_0_SECRET
+        name: edge-0
+      - credential: CHANGE_ME_EDGE_1_SECRET
+        name: edge-1
+    keys:
+      - x-api-key
+    in_header: true
+    in_query: false
+  defaultConfigDisable: false
+  matchRules:
+    - ingress:
+        - edge-usage
+      configDisable: false
+      config:
+        allow:
+          - edge-0
+          - edge-1
+  phase: AUTHN
+  priority: 310
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/key-auth:1.0.0
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: edge-usage-ai-statistics
+  namespace: higress-system
+spec:
+  defaultConfigDisable: true
+  matchRules:
+    - ingress:
+        - edge-usage
+      configDisable: false
+      config:
+        attributes:
+          - key: consumer
+            value_source: request_header
+            value: x-mse-consumer
+            apply_to_log: true
+          - key: model
+            value_source: request_body
+            value: model
+            apply_to_log: true
+          - key: input_token
+            value_source: request_body
+            value: usage.prompt_tokens
+            apply_to_log: true
+          - key: output_token
+            value_source: request_body
+            value: usage.completion_tokens
+            apply_to_log: true
+          - key: total_token
+            value_source: request_body
+            value: usage.total_tokens
+            apply_to_log: true
+          - key: edge_inference_duration_ms
+            value_source: request_body
+            value: duration_ms
+            apply_to_log: true
+          - key: event_id
+            value_source: request_body
+            value: event_id
+            apply_to_log: true
+          - key: inference_status_code
+            value_source: request_body
+            value: status_code
+            apply_to_log: true
+  phase: UNSPECIFIED_PHASE
+  priority: 200
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-statistics:1.0.0
