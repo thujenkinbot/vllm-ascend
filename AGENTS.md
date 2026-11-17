@@ -1,5 +1,15 @@
 # LWD vllm-ascend NPU 适配仓
 
+## Host PD implementation
+
+PD-specific cloud state lives in `worker/lwd_cloud_model/lwd_tail_buffer.py`
+and `lwd_decode_state.py`; D owns only its real-input tail and request-local
+MTP state. P retains host staging. DOWN carries physical and committed row
+counts separately, and P suppression is attached to batch snapshots. Host
+DSV4 expert tables follow the hidden-state all-gather layout. The vLLM source
+owns stage scheduling, output identity and result settlement; see its
+`docs/design/lwd_pd_host.md` and `docs/design/lwd_pd_cpu_validation.md`.
+
 > [!NOTE]
 > **本文件定位**: 团队隐形知识的载体. 团队隐性知识(代码位置、设计意图、约定、边界)必须落入本文件, 而不是留在成员脑中口口相传.
 > 录入重点是隐形知识, 不是具体操作步骤 —— agent 通用具备的技能(如 git 命令用法)不记录.

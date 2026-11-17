@@ -623,14 +623,16 @@ class TestExternalEmbeddingSP(unittest.TestCase):
             def _run_merged_draft(self, *args):
                 return args
 
-        context = NS(flash_comm_v1_enabled=True, pad_size=1)
+        context = NS(flash_comm_v1_enabled=True, pad_size=1, num_tokens=3, padded_num_tokens=4)
         group = NS(world_size=2, rank_in_group=1)
-        globals_ = dict(get_forward_context=lambda: context, get_tp_group=lambda: group)
+        globals_ = dict(get_forward_context=lambda: context, get_tp_group=lambda: group, enable_sp=lambda _: True)
         main = load_methods(RUNNER, {"_model_forward"}, Base, **globals_)()
+        main.vllm_config = object()
         main.supports_mm_inputs = False
         main.lwd_hash_state = None
         mtp = load_methods("worker/lwd_cloud_model/lwd_mtp_proposer.py", {"_run_merged_draft"}, Base, **globals_)()
-        mtp.is_multimodal_model = False
+        mtp.vllm_config = object()
+        mtp.runner = NS(is_multimodal_model=False)
         embeds = torch.arange(6).reshape(3, 2).float()
         positions = torch.arange(3)
         main_result = main._model_forward(3, positions=positions, inputs_embeds=embeds)

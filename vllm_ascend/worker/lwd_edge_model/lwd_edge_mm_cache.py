@@ -31,6 +31,11 @@ class LwdEdgeMmCache:
     def __init__(self) -> None:
         self._features: dict[str, list[MultiModalFeatureSpec]] = {}
         self._hash_embeds: dict[str, object] = {}
+        self._retained: set[str] = set()
+
+    def retain(self, req_ids: list[str]) -> None:
+        """Keep PD feature coordinates until the complete request retires."""
+        self._retained.update(req_ids)
 
     def register(self, req_id: str, feats: list[object]) -> None:
         """Record a new request's MM features (first chunk carries data)."""
@@ -162,6 +167,7 @@ class LwdEdgeMmCache:
         are not released with the request (capacity eviction, see
         encoder_outputs)."""
         self._features.pop(req_id, None)
+        self._retained.discard(req_id)
 
     def gather_chunk(
         self,
@@ -212,7 +218,7 @@ class LwdEdgeMmCache:
                     rows = item_embeds[start_idx:end_idx]
                     is_mm[req_start_pos + start_idx : req_start_pos + end_idx] = True
                 mm_embeds.append(rows)
-            if features and p_offset + n >= max_end:
+            if features and p_offset + n >= max_end and req_id not in self._retained:
                 self.release_request(req_id)
             req_start += n
         return mm_embeds, is_mm

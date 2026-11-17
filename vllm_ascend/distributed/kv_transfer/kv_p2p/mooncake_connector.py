@@ -1935,9 +1935,16 @@ class MooncakeConnectorScheduler:
         )
 
         if params is not None and params.get("do_remote_prefill"):
-            # Remote prefill: get all prompt blocks from remote.
-            token_ids = request.prompt_token_ids or []
-            actual = self._state_prefill_token_count(len(token_ids))
+            handoff = params.get("lwd_handoff")
+            if handoff is not None:
+                # The PD plan already accounts for state-model truncation.
+                # Embeddings-only requests have no prompt token IDs.
+                actual = int(handoff["i_end"])
+                if not 0 <= actual <= request.num_prompt_tokens:
+                    raise ValueError("LWD PD import boundary is outside the prompt")
+            else:
+                token_ids = request.prompt_token_ids or []
+                actual = self._state_prefill_token_count(len(token_ids))
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
@@ -2042,8 +2049,8 @@ class MooncakeConnectorScheduler:
         if not params.get("do_remote_decode") or request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
 
-        num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
-        computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
+        num_prompt_blocks = math.ceil(request.num_prompt_tokens / self.block_size)
+        computed_block_ids = self._get_transfer_block_ids(block_ids, request.num_prompt_tokens)
         computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0

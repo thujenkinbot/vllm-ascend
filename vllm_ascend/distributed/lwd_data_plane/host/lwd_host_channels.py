@@ -18,7 +18,7 @@ Link model:
   * the edge never listens: its UP/send and DOWN/recv IOs connect out (UHC1 is
     full-duplex, so which side binds the handshake socket is independent of
     the data direction);
-  * endpoint process within an instance: dp_rank == dp_idx and TP rank 0;
+  * endpoint process: edge DP0/TP0 serves every cloud DP; cloud DP=dp_idx/TP0;
   * warmup: only the edge waits for its links (``wait_ready``, budget
     HS_TIMEOUT_S + 5). The cloud starts before the edges, so it just reports
     the listener bound and adopts edges asynchronously; no cross-world barrier
@@ -214,8 +214,8 @@ def lwd_init_host_channels() -> None:
     selects ``data_plane_comm: host``. Identity-driven: an edge instance
     connects out to every linked cloud DP; a cloud instance binds one
     listener per its own DP and adopts edges asynchronously. Only the
-    endpoint process (dp_rank == dp_idx, TP rank 0) of a connection creates IO
-    objects.
+    edge DP0/TP0 creates every edge connection; cloud DP=dp_idx/TP0 creates
+    its own connections.
     """
     global _UCX_CHANNELS_INITIALIZED
     if _UCX_CHANNELS_INITIALIZED:
@@ -223,10 +223,9 @@ def lwd_init_host_channels() -> None:
     lwd_config = get_current_vllm_config().lwd_config
     if lwd_config is None:
         raise RuntimeError("[LWD] the host data plane requires lwd_config")
-    topology = lwd_config.topology
     role = lwd_config.role
     instance_id = lwd_config.instance_id
-    connections = topology.connections(role, instance_id)
+    connections = lwd_config.connections
     if not connections:
         raise RuntimeError(f"[LWD] no DP connections for role={role} instance={instance_id}")
     dp_rank, tp_rank = _my_dp_identity()
@@ -239,7 +238,11 @@ def lwd_init_host_channels() -> None:
     # Host memory budget gate: every link owns one pool of BLOCKS_PER_CHANNEL
     # blocks (a send direction reuses its channel's pool as D2H staging, no
     # extra arena), so need = links/2 * BLOCKS_PER_CHANNEL * (up + down).
-    endpoint_conns = [conn for conn in connections if conn.dp_idx == dp_rank and tp_rank == 0]
+    endpoint_conns = [
+        conn
+        for conn in connections
+        if tp_rank == 0 and (dp_rank == 0 if role == "edge" else conn.connection_id.dp_idx == dp_rank)
+    ]
     links = 2 * len(endpoint_conns)
     need_mb = _host_memory_need_mb(links, up_block_mb=up_block_mb, down_block_mb=down_block_mb)
     limit_mb = _HOST_MEM_BUDGET_MB
@@ -261,10 +264,11 @@ def lwd_init_host_channels() -> None:
 
     qos = _qos_data_plane()
     for conn in endpoint_conns:
+        identity = conn.connection_id
         if conn.cloud.data_port is None:
             raise RuntimeError(
                 f"[LWD] host data plane requires 'data_port' on the cloud DP "
-                f"(cloud={conn.cloud_id}, dp_idx={conn.dp_idx}); set it in "
+                f"(cloud={identity.cloud_id}, dp_idx={identity.dp_idx}); set it in "
                 "the topology file (edges never listen; ctrl_port is "
                 "control-plane only)"
             )
@@ -278,8 +282,11 @@ def lwd_init_host_channels() -> None:
         # engine-side listener may be built (old-branch semantics).
         listener = None
         if role == "cloud" and not _sidecar:
-            listener = LwdUcxListener(addr, port)
-            _UCX_LISTENERS[(conn.cloud_id, conn.dp_idx)] = listener
+            listener_key = (identity.cloud_id, identity.dp_idx)
+            listener = _UCX_LISTENERS.get(listener_key)
+            if listener is None:
+                listener = LwdUcxListener(addr, port)
+                _UCX_LISTENERS[listener_key] = listener
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
             # Edge: UP sender / DOWN receiver, both connect out (the edge
             # never listens -- UHC1 is full-duplex). Cloud: UP receiver /
@@ -290,7 +297,7 @@ def lwd_init_host_channels() -> None:
             else:
                 op = "recv" if channel is LwdChannelType.UP else "send"
                 serve = True
-            _UCX_IOS[(conn.edge_id, conn.cloud_id, conn.dp_idx, channel, op)] = LwdNpuUcxChannelIo(
+            _UCX_IOS[(identity.edge_id, identity.cloud_id, identity.dp_idx, channel, op)] = LwdNpuUcxChannelIo(
                 channel,
                 torch.npu.Stream(priority=-1),
                 LwdNpuUcxChannelIoConfig(
@@ -300,7 +307,7 @@ def lwd_init_host_channels() -> None:
                     host=addr,
                     port=port,
                     serve=serve,
-                    token=_link_token(conn.edge_id, conn.cloud_id, conn.dp_idx, channel),
+                    token=_link_token(identity.edge_id, identity.cloud_id, identity.dp_idx, channel),
                     listener=listener,
                     transport_mode="daemon" if _sidecar else "embedded",
                     traffic_class=qos.traffic_class,
@@ -348,8 +355,7 @@ def _io(edge_id: int, cloud_id: int, dp_idx: int, channel: LwdChannelType, op: s
         raise RuntimeError(
             f"[LWD] this process holds no UCX {op} IO of {channel.value} on "
             f"(edge={edge_id}, cloud={cloud_id}, dp_idx={dp_idx}); only the "
-            f"endpoint process (dp_rank==dp_idx, tp_rank==0) of the "
-            "connection does"
+            "edge DP0/TP0 or matching cloud DP/TP0 endpoint does"
         ) from None
 
 

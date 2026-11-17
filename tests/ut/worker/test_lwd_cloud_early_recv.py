@@ -30,9 +30,11 @@ def load_module(name: str, path: Path, modules: dict[str, types.ModuleType] | No
     return module
 
 
+topology = load_module("lwd_topology_for_early_recv_test", ROOT.parent / "vllm/vllm/config/lwd/topology.py")
 lwd_types = load_module(
     "lwd_types_for_cloud_early_recv_test",
     ROOT / "vllm_ascend/distributed/lwd_data_plane/lwd_types.py",
+    {"vllm.config.lwd.topology": topology},
 )
 envs = load_module("envs_for_cloud_early_recv_test", ROOT / "vllm_ascend/envs.py")
 parents = {
@@ -58,7 +60,15 @@ fake_logger_module.lwd_logger = logging.getLogger("lwd-cloud-early-recv-test")
 host_stage = load_module(
     "lwd_host_stage_for_cloud_early_recv_test",
     ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_host_stage.py",
-    {"vllm": fake_vllm, "vllm.lwd_logger": fake_logger_module},
+    {
+        **parents,
+        "vllm": fake_vllm,
+        "vllm.lwd_logger": fake_logger_module,
+        "vllm_ascend.distributed.lwd_data_plane.lwd_types": lwd_types,
+    },
+)
+tail_buffer = load_module(
+    "lwd_tail_buffer_for_early_recv_test", ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_tail_buffer.py"
 )
 
 
@@ -81,6 +91,7 @@ def load_worker_methods():
         "_report_irecv_completions",
         "_lwd_up_post_recvs",
         "_lwd_cloud_flush_finished",
+        "_lwd_buffer_received_tails",
     }
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
@@ -98,6 +109,8 @@ def load_worker_methods():
         "LwdHostStageSlotBusy": host_stage.LwdHostStageSlotBusy,
         "LwdHostStager": host_stage.LwdHostStager,
         "LwdRecvHintFields": pre_recv.LwdRecvHintFields,
+        "LwdTailBuffer": tail_buffer.LwdTailBuffer,
+        "LwdTailInput": tail_buffer.LwdTailInput,
         "hash_layer_count": lambda hf_config: hf_config.num_hash_layers,
         "hash_payload_numel": lambda rows, hidden, layers, top_k: rows * (hidden + 4 * layers * top_k),
         "lwd_get_data_plane": lambda: None,
@@ -254,6 +267,7 @@ def worker(monkeypatch: pytest.MonkeyPatch):
     data_plane = FakeDataPlane()
     monkeypatch.setitem(worker_globals, "lwd_get_data_plane", lambda: data_plane)
     instance = Worker()
+    instance.vllm_config = NS(lwd_config=NS(pd=NS(enabled=False), stage_role=""))
     instance._init_lwd_early_recv_state()
     instance.device = "cpu"
     instance.rank = 0
@@ -428,6 +442,46 @@ def test_submit_failure_abandons_device_allocation(worker) -> None:
     assert worker._lwd_stager.busy_slots() == []
     assert not worker._early_recv_pending
     assert not worker._early_recv_futures
+
+
+def test_d_pending_or_failed_connection_does_not_block_another_tail(two_connection_worker, monkeypatch) -> None:
+    import torch
+
+    worker = two_connection_worker
+    worker._lwd_pd_decode = True
+    worker._lwd_stager = None
+    worker._lwd_tail_buffer = tail_buffer.LwdTailBuffer()
+    blocked, ready = FakeFuture(), FakeFuture()
+    blocked.is_done = False
+    payload = torch.arange(4, dtype=torch.bfloat16)
+    ready.result = lambda: NS(tensor=payload)
+    first_key = (DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 0)
+    next_key = (OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 0)
+    worker._early_recv_futures = {first_key: blocked, next_key: ready}
+    hint = pre_recv.make_recv_hint(
+        0,
+        1,
+        connection_id=OTHER_CONNECTION,
+        req_ids=["b"],
+        rows=[1],
+        prompt_offsets=[8191],
+        prompt_lens=[8192],
+        binding_ids=["binding-b"],
+        attempt_ids=["attempt-b"],
+    )
+    worker._lwd_tail_recv_fields[next_key] = pre_recv.hint_fields(hint)
+    monkeypatch.setitem(worker_globals, "torch", torch)
+    monkeypatch.setattr(torch, "npu", NS(Event=mock.Mock, current_stream=mock.Mock()), raising=False)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *args: None)
+    worker._report_irecv_completions()
+    assert first_key in worker._early_recv_futures and next_key not in worker._early_recv_futures
+    assert worker._irecv_done_mqs[OTHER_CONNECTION].items == [(next_key, [("b", 8192)])]
+    blocked.is_done = True
+    blocked.error = RuntimeError("connection A failed")
+    worker._report_irecv_completions()
+    assert worker._data_plane.aborted_connections == [DEFAULT_CONNECTION]
+    value = worker._lwd_tail_buffer.take("b", "binding-b", "attempt-b", 8191, 1)
+    torch.testing.assert_close(value.payload, payload)
 
 
 def test_loop_reports_submit_error_and_stops_reading_hints(worker) -> None:

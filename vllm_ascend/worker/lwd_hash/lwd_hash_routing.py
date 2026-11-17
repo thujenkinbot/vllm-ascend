@@ -1,10 +1,18 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Lossless LWD expert-ID transport and request-position bookkeeping."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
 import torch
 
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
-def hash_layer_count(config: "PretrainedConfig") -> int:
+
+def hash_layer_count(config: PretrainedConfig) -> int:
     """Return the Hash MoE layer count for DeepSeek V4; zero for other models."""
     return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
 
@@ -33,7 +41,7 @@ def unpack_hash_payload(
     hidden_size: int,
     num_layers: int,
     top_k: int,
-) -> "tuple[torch.Tensor, torch.Tensor]":
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate and unpack the payload; returns on-device embeddings and CPU int32 expert IDs."""
     expected = hash_payload_numel(num_tokens, hidden_size, num_layers, top_k)
     if payload.numel() != expected:
@@ -74,9 +82,7 @@ class LwdHashRoutingState:
         """Release a request's expert IDs and validity mask; a missing request is a no-op."""
         self.requests.pop(req_id, None)
 
-    def add_chunk(
-        self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor
-    ) -> None:
+    def add_chunk(self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor) -> None:
         """Validate a remote expert-ID chunk, write it into the request's absolute prompt position and mark it valid."""
         ids = expert_ids.to(device="cpu", dtype=torch.int32)
         if ids.ndim != 3 or tuple(ids.shape[1:]) != (self.num_layers, self.top_k):
@@ -98,12 +104,12 @@ class LwdHashRoutingState:
 
     def build_batch(
         self,
-        req_ids: "Sequence[str]",
-        counts: "Sequence[int]",
-        computed: "Sequence[int]",
-        prompt_lengths: "Sequence[int]",
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """Assemble CPU expert IDs and the prompt mask by request order and computed positions; raise when prompt data is missing."""
+        req_ids: Sequence[str],
+        counts: Sequence[int],
+        computed: Sequence[int],
+        prompt_lengths: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Assemble prompt experts by absolute position, rejecting missing rows."""
         if not len(req_ids) == len(counts) == len(computed) == len(prompt_lengths):
             raise ValueError("LWD Hash routing batch metadata lengths do not match")
         total = sum(int(n) for n in counts)

@@ -48,6 +48,8 @@ class LwdRecvHintFields(NamedTuple):
     prompt_lens: list[int]
     refills: list[bool]
     prefix_nonces: list[int]
+    binding_ids: tuple[str, ...] = ()
+    attempt_ids: tuple[str, ...] = ()
 
 
 def make_recv_hint(
@@ -62,6 +64,8 @@ def make_recv_hint(
     prompt_lens: list[int],
     refills: list[bool] | None = None,
     prefix_nonces: list[int] | None = None,
+    binding_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build one UP hint with the complete per-request chunk geometry."""
     return {
@@ -76,6 +80,8 @@ def make_recv_hint(
         "prompt_lens": [int(value) for value in prompt_lens],
         "refills": [bool(value) for value in (refills or ())],
         "prefix_nonces": list(prefix_nonces or ()),
+        "binding_ids": list(binding_ids or ()),
+        "attempt_ids": list(attempt_ids or ()),
     }
 
 
@@ -86,7 +92,9 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
     table_names = ("req_ids", "rows", "prompt_offsets", "prompt_lens")
     if any(not isinstance(hint.get(name), list) for name in table_names):
         return None
-    if any(not isinstance(hint.get(name, []), list) for name in ("refills", "prefix_nonces")):
+    if any(
+        not isinstance(hint.get(name, []), list) for name in ("refills", "prefix_nonces", "binding_ids", "attempt_ids")
+    ):
         return None
     try:
         connection = hint.get("connection_id")
@@ -103,6 +111,8 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
             prompt_lens=[int(value) for value in hint["prompt_lens"]],
             refills=[bool(value) for value in hint.get("refills", [])],
             prefix_nonces=list(hint.get("prefix_nonces", [])),
+            binding_ids=tuple(hint.get("binding_ids", [])),
+            attempt_ids=tuple(hint.get("attempt_ids", [])),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -130,6 +140,12 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
         return None
     fields.refills.extend([False] * (len(fields.req_ids) - len(fields.refills)))
     fields.prefix_nonces.extend([0] * (len(fields.req_ids) - len(fields.prefix_nonces)))
+    for identities in (fields.binding_ids, fields.attempt_ids):
+        if identities and (
+            len(identities) != len(fields.req_ids)
+            or any(not isinstance(value, str) or not value for value in identities)
+        ):
+            return None
     return fields
 
 

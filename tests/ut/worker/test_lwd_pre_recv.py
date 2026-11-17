@@ -24,9 +24,11 @@ def load_module(name: str, path: Path, modules: dict[str, types.ModuleType] | No
     return module
 
 
+topology = load_module("lwd_topology_for_pre_recv_test", ROOT.parent / "vllm/vllm/config/lwd/topology.py")
 lwd_types = load_module(
     "lwd_types_for_pre_recv_test",
     ROOT / "vllm_ascend/distributed/lwd_data_plane/lwd_types.py",
+    {"vllm.config.lwd.topology": topology},
 )
 envs = load_module("envs_for_pre_recv_test", ROOT / "vllm_ascend/envs.py")
 parents = {
@@ -75,6 +77,8 @@ def test_make_hint_preserves_complete_row_tables() -> None:
         "prompt_lens": [5, 4],
         "refills": [],
         "prefix_nonces": [],
+        "binding_ids": [],
+        "attempt_ids": [],
     }
     assert pre_recv.hint_fields(hint) == pre_recv.LwdRecvHintFields(
         lwd_types.ConnectionId(0, 0, 0),

@@ -24,6 +24,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+from vllm_ascend.worker.lwd_hash.lwd_hash_allgather import lwd_all_gather_hash_expert_ids
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import merge_hash_expert_ids
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
@@ -198,7 +199,11 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
-                    input_ids = prepare_finalize.all_gather_input_ids(input_ids)
+                    if remote_ids is not None:
+                        tid2eid_ones = lwd_all_gather_hash_expert_ids(tid2eid_ones, prepare_finalize.moe_config)
+                        input_ids = torch.arange(tid2eid_ones.shape[0], device=router_logits.device, dtype=torch.int64)
+                    else:
+                        input_ids = prepare_finalize.all_gather_input_ids(input_ids)
                 else:
                     input_ids = _EXTRA_CTX.moe_comm_method.pad_and_split_input_ids(input_ids)
                 if _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER and input_ids.numel() != router_logits.shape[0]:

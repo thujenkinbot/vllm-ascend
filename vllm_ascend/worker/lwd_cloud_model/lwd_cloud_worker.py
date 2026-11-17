@@ -45,6 +45,7 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
     LwdHostStager,
     LwdHostStageSlotBusy,
 )
+from vllm_ascend.worker.lwd_cloud_model.lwd_tail_buffer import LwdTailBuffer, LwdTailInput
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
 
 if TYPE_CHECKING:
@@ -133,6 +134,10 @@ class LwdCloudWorker(LwdWorkerBase):
     def _lwd_init_lwd_host_stager(self) -> None:
         """Create endpoint host staging with fixed limits."""
         self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
+        if self._lwd_pd_decode:
+            pd = self.vllm_config.lwd_config.pd
+            self._lwd_tail_buffer = LwdTailBuffer(pd.request_ttl_s + pd.result_hold_timeout_s)
+            return
         max_numel = hash_payload_numel(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             self._lwd_up_hidden_size,
@@ -212,12 +217,16 @@ class LwdCloudWorker(LwdWorkerBase):
         if batch is None or batch.batch_type is not LwdBatchType.LWD_EMBED:
             return
         meta = batch.batch_meta
-        if meta is None or self._lwd_stager is None:
+        if meta is None:
             return
         if connection_from(meta) not in self._lwd_early_recv_connections:
             return
         for req_id in meta.aborted_req_ids or ():
-            self._lwd_stager.abort_request(req_id)
+            if self._lwd_tail_buffer is not None:
+                binding, attempt = getattr(meta, "aborted_pd_bindings", {}).get(req_id, ("", ""))
+                self._lwd_tail_buffer.retire(req_id, binding, attempt)
+            elif self._lwd_stager is not None:
+                self._lwd_stager.abort_request(req_id)
 
     # ------------------------------------------------------------------ #
     # Early receive: comm thread (hint -> post recv -> report watermark) #
@@ -235,6 +244,10 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_rr = 0
         self._early_recv_lock = threading.Lock()
         self._lwd_stager: LwdHostStager | None = None
+        config = self.vllm_config.lwd_config
+        self._lwd_pd_decode = config.pd.enabled and config.stage_role == "decode"
+        self._lwd_tail_buffer: LwdTailBuffer | None = None
+        self._lwd_tail_recv_fields: dict[tuple[ConnectionId, LwdChannelType, int], LwdRecvHintFields] = {}
         self._irecv_hint_mqs: dict[ConnectionId, Any] = {}
         self._irecv_done_mqs: dict[ConnectionId, Any] = {}
         self._lwd_early_recv_thread: threading.Thread | None = None
@@ -396,6 +409,11 @@ class LwdCloudWorker(LwdWorkerBase):
                 self._lwd_stager.abandon_connection(connection)
             except Exception:
                 lwd_logger.exception("[Lwd][pre-recv] failed to clean host staging connection=%s", connection)
+        if self._lwd_tail_buffer is not None:
+            self._lwd_tail_buffer.abandon_connection(connection)
+        for key in list(self._lwd_tail_recv_fields):
+            if key[0] == connection:
+                self._lwd_tail_recv_fields.pop(key, None)
         try:
             lwd_get_data_plane().abort_connection(connection, exc)
         except Exception:
@@ -449,13 +467,26 @@ class LwdCloudWorker(LwdWorkerBase):
     def _lwd_submit_early_recv(self, fields: LwdRecvHintFields) -> LwdTransferFuture:
         """Plan host destinations, allocate a device slot, and submit one receive."""
         stager = self._lwd_stager
-        assert stager is not None
         numel = hash_payload_numel(
             fields.num_tokens,
             self._lwd_up_hidden_size,
             self._lwd_up_num_hash_layers,
             self._lwd_up_num_experts_per_tok,
         )
+        if self._lwd_pd_decode:
+            if not fields.binding_ids or not fields.attempt_ids:
+                raise ValueError("PD D tail hint requires binding and attempt identities")
+            if any(
+                offset != length - 1 or rows != 1
+                for offset, rows, length in zip(fields.prompt_offsets, fields.rows, fields.prompt_lens)
+            ):
+                raise ValueError("PD D receives only the planned final prompt row")
+            recv_buffer = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
+            request = self._lwd_build_up_recv_request(fields, recv_buffer, [])
+            future = lwd_get_data_plane().submit_recv(request)
+            self._lwd_tail_recv_fields[(fields.connection, LwdChannelType.UP, fields.seqno)] = fields
+            return future
+        assert stager is not None
         stage_key = (fields.connection, fields.seqno)
         recv_buffer, _slot = stager.allocate(stage_key, numel)
         segments = stager.plan_recv_segments(
@@ -578,7 +609,7 @@ class LwdCloudWorker(LwdWorkerBase):
     def _report_irecv_completions(self) -> None:
         """Publish each connection's contiguous completion prefix independently."""
         stager = self._lwd_stager
-        if stager is None:
+        if stager is None and self._lwd_tail_buffer is None:
             return
         with self._early_recv_lock:
             pending = sorted(self._early_recv_futures.items(), key=lambda item: (item[0][0], item[0][2]))
@@ -599,18 +630,25 @@ class LwdCloudWorker(LwdWorkerBase):
                 if not future.done():
                     blocked.add(connection)
                     continue
-                future.result()
-                if not future.staged_done():
+                result = future.result()
+                if not self._lwd_pd_decode and not future.staged_done():
                     blocked.add(connection)
                     continue
-                future.result()
+                # staged_done may discover a D2H error after the first result
+                # check; surface it before publishing an arrival watermark.
+                if not self._lwd_pd_decode:
+                    future.result()
                 stage_key = (connection, seqno)
-                published = stager.publish_received(stage_key)
-                stager.release_if_drained(stage_key)
+                if self._lwd_pd_decode:
+                    published = self._lwd_buffer_received_tails(key, result.tensor)
+                else:
+                    published = stager.publish_received(stage_key)
+                    stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
-                for req_id, nonce in stager.take_refill_done(connection):
-                    done_mq.enqueue(("refill_done", req_id, nonce))
+                if stager is not None:
+                    for req_id, nonce in stager.take_refill_done(connection):
+                        done_mq.enqueue(("refill_done", req_id, nonce))
                 done_mq.enqueue((key, arrived))
             except Exception as exc:
                 self._lwd_fail_early_recv_connection(connection, seqno, exc)
@@ -631,6 +669,35 @@ class LwdCloudWorker(LwdWorkerBase):
             )
         self._early_recv_pump()
 
+    def _lwd_buffer_received_tails(
+        self, key: tuple[ConnectionId, LwdChannelType, int], tensor: torch.Tensor
+    ) -> list[tuple[str, int, int]]:
+        """Copy tail rows into independent storage before releasing the receive."""
+        fields = self._lwd_tail_recv_fields.pop(key)
+        buffer = self._lwd_tail_buffer
+        assert buffer is not None
+        hidden = self._lwd_up_hidden_size
+        tail = 4 * self._lwd_up_num_hash_layers * self._lwd_up_num_experts_per_tok
+        tensor.record_stream(torch.npu.current_stream())
+        embed_numel = fields.num_tokens * hidden
+        published: list[tuple[str, int, int]] = []
+        row = 0
+        for req_id, rows, start, binding, attempt in zip(
+            fields.req_ids, fields.rows, fields.prompt_offsets, fields.binding_ids, fields.attempt_ids
+        ):
+            embeds = tensor[row * hidden : (row + rows) * hidden]
+            if tail:
+                experts = tensor[embed_numel + row * tail : embed_numel + (row + rows) * tail]
+                payload = torch.cat((embeds, experts))
+            else:
+                payload = embeds.clone()
+            ready = torch.npu.Event()
+            ready.record()
+            if buffer.put(req_id, LwdTailInput(fields.connection, binding, attempt, start, rows, payload, ready)):
+                published.append((req_id, rows, start))
+            row += rows
+        return published
+
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         _t0 = time.monotonic()
@@ -645,6 +712,7 @@ class LwdCloudWorker(LwdWorkerBase):
             is_driver = get_tp_group().is_first_rank
             carriers = []
             ready_events = {}
+            pd_metadata = {}
             for payload in payloads:
                 connection = payload.connection
                 hidden = payload.hidden
@@ -681,6 +749,13 @@ class LwdCloudWorker(LwdWorkerBase):
                 carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)
                 carriers.append(carrier)
                 ready_events[connection] = ready_event
+                identities = getattr(payload, "pd_identities", ())
+                if identities and any(attempt for attempt, _binding in identities):
+                    pd_metadata[(connection, seqno)] = {
+                        "attempt_ids": [attempt for attempt, _binding in identities],
+                        "binding_ids": [binding for _attempt, binding in identities],
+                        "row_counts": list(seg_lens_host) if seg_lens_host is not None else [1] * len(req_ids),
+                    }
                 lwd_logger.info(
                     "[Lwd][perf] cloud-step connection=%s seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
                     connection,
@@ -693,6 +768,7 @@ class LwdCloudWorker(LwdWorkerBase):
             if is_driver and output is not None:
                 target = getattr(output, "_model_runner_output", output)
                 target.lwd_down_carriers = carriers
+                target.lwd_pd_down_metadata = pd_metadata
                 # The events belong to this output generation and must be
                 # consumed before the output crosses the process boundary.
                 target.lwd_meta_ready_events = ready_events
@@ -729,6 +805,13 @@ class LwdCloudWorker(LwdWorkerBase):
     def _lwd_cloud_flush_finished(self, finished_req_ids: list[str]) -> None:
         """Release runner bookkeeping and all host-stage request storage."""
         lwd_logger.info("[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids))
+        if self._lwd_tail_buffer is not None:
+            for req_id in finished_req_ids:
+                identity = self.model_runner._lwd_pd_requests.get(req_id)
+                if identity is not None:
+                    self._lwd_tail_buffer.retire(req_id, identity.binding_id, identity.attempt_id)
+                else:
+                    self._lwd_tail_buffer.retire(req_id)
         self.model_runner.lwd_release_finished(finished_req_ids)
         if self._lwd_stager is None:
             return

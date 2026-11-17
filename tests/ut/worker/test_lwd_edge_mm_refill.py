@@ -141,6 +141,23 @@ def test_normal_chunk_keeps_new_registration() -> None:
     assert cache._features["r"] == [feature]
 
 
+def test_pd_preserves_media_coordinates_after_p_until_d_tail_and_final_finish() -> None:
+    cache = _CACHE_CLS()
+    feature = _feature("media", 0, 4)
+    encoded = torch.arange(8).reshape(4, 2)
+    cache._hash_embeds["media"] = encoded
+    runner = _runner(cache)
+    p_batch = NS(req_ids=["r"], token_ids=[[1, 2, 3, 4]], prompt_offsets=[0], retain_mm_req_ids=["r"])
+    runner._lwd_gather_mm(p_batch, NS(scheduled_new_reqs=[_new_req(feature)]), NS())
+    assert cache._features["r"] == [feature]
+    d_batch = NS(req_ids=["r"], token_ids=[[4]], prompt_offsets=[3])
+    values, mask = runner._lwd_gather_mm(d_batch, NS(scheduled_new_reqs=[]), NS())
+    torch.testing.assert_close(values[0], encoded[3:4])
+    assert mask.tolist() == [True]
+    cache.release_finished(["r"])
+    assert "r" not in cache._features and "r" not in cache._retained
+
+
 def test_prefix_covered_feature_needs_no_data_or_hash() -> None:
     cache = _CACHE_CLS()
     cache.register("r", [_feature("covered", 0, 2)])

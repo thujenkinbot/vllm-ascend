@@ -165,6 +165,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         is_refill = getattr(batch_meta, "is_refill", False)
         new_reqs = scheduler_output.scheduled_new_reqs
+        self.mm_cache.retain(list(getattr(batch_meta, "retain_mm_req_ids", ())))
+        self.mm_cache.retain([req.req_id for req in new_reqs if getattr(req, "lwd_pd_stage_role", "")])
         snapshot = self.mm_cache.snapshot_features([req_data.req_id for req_data in new_reqs]) if is_refill else {}
         try:
             for req_data in new_reqs:
@@ -286,6 +288,29 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
+        valid_rows = batch_meta.valid_rows
+        if valid_rows:
+            physical = batch_meta.physical_rows
+            if not (
+                len(physical) == len(valid_rows) == len(batch_meta.req_ids)
+                and sum(physical) == hidden_states.shape[0]
+                and all(0 <= valid <= count for count, valid in zip(physical, valid_rows))
+                and [len(ranks) for ranks in batch_meta.top_id_ths] == valid_rows
+            ):
+                raise RuntimeError("PD DOWN physical and valid row geometry disagree")
+            indices: list[int] = []
+            offset = 0
+            for count, valid in zip(physical, valid_rows):
+                indices.extend(range(offset, offset + valid))
+                offset += count
+            if not indices:
+                output = self._lwd_watermarked_output()
+                output.req_ids = batch_meta.req_ids
+                output.req_id_to_index = {rid: idx for idx, rid in enumerate(batch_meta.req_ids)}
+                output.sampled_token_ids = [[] for _ in batch_meta.req_ids]
+                return output
+            index = torch.tensor(indices, dtype=torch.int64, device=hidden_states.device)
+            hidden_states = hidden_states.index_select(0, index)
         # lm_head must not be called directly (ParallelLMHead.forward
         # forces the sampler path); compute_logits is the standard
         # interface present on both wrapper and monolithic models.
@@ -314,7 +339,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         flat_ids = select_token_batch(logits, [r for ranks in batch_meta.top_id_ths for r in ranks])
         sampled_token_ids = []
         off = 0
-        for accept, ranks in zip(batch_meta.num_accept_tokens, batch_meta.top_id_ths):
+        counts = valid_rows if valid_rows else batch_meta.num_accept_tokens
+        for accept, ranks in zip(counts, batch_meta.top_id_ths):
             sampled_token_ids.append(flat_ids[off : off + accept])
             off += len(ranks)
         _t_sel = time.monotonic()

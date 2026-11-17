@@ -82,31 +82,6 @@ def test_no_is_lwd_gates_inside_lwd_runner() -> None:
     assert 'getattr(self.vllm_config, "lwd_config", None)' not in src
 
 
-def test_draft_cache_weave_removed() -> None:
-    """Guard for the LwdDraftCache removal (same argument as the base
-    spec-recovery-chain removal).
-
-    The restore path has zero consumers on the current pdmix line:
-    decode requests are never evicted (whole prefill notifies defer),
-    the native max_tokens guard is depart-and-finish (the request
-    necessarily finishes; no returning step), and the V2 cadence guard
-    is dead on the cloud (V1 enforced). With the removal, the cloud
-    runner's draft state stays native (_prepare_input_ids remains
-    unoverridden). If the phase arm (phase_scheduler) is ever rewired,
-    a departure-safe draft keeper must return with it.
-    """
-    runner_src = _RUNNER.read_text(encoding="utf-8")
-    for symbol in ("LwdDraftCache", "_lwd_draft_cache", "_lwd_restore_drafts"):
-        assert symbol not in runner_src, f"draft-cache weave leaked back: {symbol}"
-    # _prepare_input_ids must stay unoverridden (the draft-refill chain
-    # was removed wholesale); _update_states only rewinds the host read
-    # pointer and rebuilds prompt-embeds placeholders, never draft state.
-    assert "def _prepare_input_ids(" not in runner_src
-    assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py").exists(), (
-        "deleted module must not come back"
-    )
-
-
 def test_pinned_staging_single_implementation() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     edge = _EDGE.read_text(encoding="utf-8")
@@ -174,7 +149,6 @@ def test_watermark_mrope_and_expert_failfast_contracts() -> None:
     assert "consumed != expect" in stage
     assert "STAGE POSITION MISMATCH" in stage
     prime = _segment(_RUNNER, "_lwd_prime_mrope_positions")
-    assert "len(payload) != expected_numel * 8" in prime
     assert "positions.max().item()" in prime
     decode = _segment(_RUNNER, "_lwd_decode_expert_ids")
     assert ".to(torch.uint8).view(torch.int32)" in decode
